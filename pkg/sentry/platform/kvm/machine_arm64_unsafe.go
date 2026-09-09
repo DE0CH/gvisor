@@ -26,6 +26,7 @@ import (
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/hostsyscall"
+	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/ring0"
 	"gvisor.dev/gvisor/pkg/ring0/pagetables"
 	"gvisor.dev/gvisor/pkg/sentry/platform"
@@ -76,6 +77,15 @@ func (m *machine) initArchState() error {
 			return err
 		}
 	}
+
+	// Cache the counter frequency.
+	if freq := ktime.CNTFRQ(); freq > 0 {
+		m.tscFrequency = freq
+	} else {
+		log.Warningf("CNTFRQ_EL0 reads back as zero; the counter frequency is unknown")
+	}
+	log.Debugf("Host counter frequency: %d Hz.", m.tscFrequency)
+
 	return nil
 }
 
@@ -299,7 +309,7 @@ func (c *vCPU) setSystemTime() error {
 		upperThreshold := (((minimum << 3) + minimum) >> 3)
 		if iter >= minIterations && (current <= upperThreshold || minimum < 50) {
 			// Try to set the TSC
-			if err := c.setTSC(end + (minimum / 2)); err != nil {
+			if err := c.setTSC(end + (minimum / 2) + c.machine.tscOffset); err != nil {
 				return err
 			}
 			return nil

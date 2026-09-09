@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"gvisor.dev/gvisor/pkg/log"
+	"gvisor.dev/gvisor/pkg/sentry/kernel"
 )
 
 // The save metadata keys for timestamp.
@@ -30,7 +31,8 @@ const (
 	metadataTimestamp = "timestamp"
 )
 
-func addSaveMetadata(m map[string]string) {
+// addSaveMetadata supplements the save metadata.
+func addSaveMetadata(m map[string]string, k *kernel.Kernel) {
 	t, err := CPUTime()
 	if err != nil {
 		log.Warningf("Error getting cpu time: %v", err)
@@ -45,4 +47,6 @@ func addSaveMetadata(m map[string]string) {
 	m[cpuUsage] = t.String()
 
 	m[metadataTimestamp] = fmt.Sprintf("%v", time.Now())
+
+	addTSCSaveMetadata(m, k)
 }
