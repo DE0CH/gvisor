@@ -57,6 +57,7 @@ func newTestSharedContext(t *testing.T) *sharedContext {
 			threadID: {thread: child},
 		},
 	}
+	s.syscallThread.subproc = s
 	shared := &sysmsg.ThreadContext{}
 	shared.Init(threadID)
 	atomic.StoreUint64(&shared.AckedTime, 1)
@@ -273,6 +274,34 @@ func TestCreateSysmsgThreadDeadClone(t *testing.T) {
 	}
 	if _, ok := s.sysmsgStackPool.Get(); !ok {
 		t.Fatalf("expected sysmsgStackID to be returned to pool on failure")
+	}
+}
+
+func TestSyscallThreadKillMarksSubprocessDead(t *testing.T) {
+	sc := newTestSharedContext(t)
+	s := sc.subprocess
+
+	s.syscallThread.kill()
+	if !s.dead.Load() {
+		t.Fatalf("expected subprocess to be marked dead after syscallThread.kill()")
+	}
+	if err := s.createSysmsgThread(); !errors.Is(err, errDeadSubprocess) {
+		t.Fatalf("createSysmsgThread got error %v, want %v", err, errDeadSubprocess)
+	}
+	req := requestThread{thread: make(chan *thread, 1)}
+	s.handlePtraceSyscallRequest(req)
+	if got := <-req.thread; got != nil {
+		t.Fatalf("handlePtraceSyscallRequest got %v, want nil when subprocess is dead", got)
+	}
+}
+
+func TestInitSyscallThreadPoolExhausted(t *testing.T) {
+	s := &subprocess{
+		sysmsgStackPool: pool.Pool{Start: 0, Limit: 0},
+	}
+	p := &thread{tgid: 1 << 30, tid: 1 << 30}
+	if err := s.initSyscallThread(p, false); err == nil {
+		t.Fatalf("initSyscallThread succeeded when pool was exhausted, want error")
 	}
 }
 
