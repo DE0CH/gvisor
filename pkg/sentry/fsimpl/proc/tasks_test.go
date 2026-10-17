@@ -822,3 +822,58 @@ func TestSysNetIPv4FileModes(t *testing.T) {
 		}
 	}
 }
+
+func readLoadavg(t *testing.T, s *testutil.System) string {
+	t.Helper()
+	fd, err := s.VFS.OpenAt(s.Ctx, s.Creds, s.PathOpAtRoot("/proc/loadavg"), &vfs.OpenOptions{})
+	if err != nil {
+		t.Fatalf("OpenAt(/proc/loadavg) failed: %v", err)
+	}
+	defer fd.DecRef(s.Ctx)
+
+	content, err := s.ReadToEnd(fd)
+	if err != nil {
+		t.Fatalf("ReadToEnd(/proc/loadavg) failed: %v", err)
+	}
+	return content
+}
+
+func TestLoadavg(t *testing.T) {
+	s := setup(t)
+	defer s.Destroy()
+
+	if got, want := readLoadavg(t, s), "0.00 0.00 0.00 0/0 0\n"; got != want {
+		t.Errorf("readLoadavg() initial = %q, want %q", got, want)
+	}
+
+	k := kernel.KernelFromContext(s.Ctx)
+	k.RootPIDNamespace().ReserveInitTID()
+	if got, want := readLoadavg(t, s), "0.00 0.00 0.00 0/0 1\n"; got != want {
+		t.Errorf("readLoadavg() after ReserveInitTID = %q, want %q", got, want)
+	}
+
+	for i := range 3 {
+		tc := k.NewThreadGroup(k.RootPIDNamespace(), kernel.NewSignalHandlers(), linux.SIGCHLD, k.GlobalInit().Limits())
+		if _, err := testutil.CreateTask(s.Ctx, fmt.Sprintf("task-%d", i), tc, s.MntNs, s.Root, s.Root); err != nil {
+			t.Fatalf("CreateTask(%d): %v", i, err)
+		}
+	}
+
+	if got, want := readLoadavg(t, s), "0.00 0.00 0.00 0/3 4\n"; got != want {
+		t.Errorf("readLoadavg() after 3 root tasks = %q, want %q", got, want)
+	}
+
+	childNS := k.RootPIDNamespace().NewChild(s.Ctx, k, s.Creds.UserNamespace)
+	childTG := k.NewThreadGroup(childNS, kernel.NewSignalHandlers(), linux.SIGCHLD, k.GlobalInit().Limits())
+	childTask, err := testutil.CreateTask(s.Ctx, "child-task", childTG, s.MntNs, s.Root, s.Root)
+	if err != nil {
+		t.Fatalf("CreateTask(child-task): %v", err)
+	}
+
+	if got, want := readLoadavg(t, s.WithTemporaryContext(childTask.AsyncContext())), "0.00 0.00 0.00 0/4 1\n"; got != want {
+		t.Errorf("readLoadavg() in child PIDNamespace = %q, want %q", got, want)
+	}
+	if got, want := readLoadavg(t, s), "0.00 0.00 0.00 0/4 5\n"; got != want {
+		t.Errorf("readLoadavg() in root PIDNamespace = %q, want %q", got, want)
+	}
+}
