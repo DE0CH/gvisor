@@ -324,3 +324,70 @@ func TestPrecopySaveLoad(t *testing.T) {
 		})
 	}
 }
+
+// TestAsyncLoadHoldBulk checks that while bulk loading is held, only awaited
+// pages are loaded, and that releasing it loads the rest.
+func TestAsyncLoadHoldBulk(t *testing.T) {
+	f := newSaveTestMemoryFile(t, false)
+	r := allocate(t, f, 64)
+	for i := uint64(0); i < 64; i++ {
+		writePage(t, f, r.Start+i*pg, byte(i+1), true)
+	}
+	pagesFile, err := os.CreateTemp("/dev/shm", "pgalloc-hold-test")
+	if err != nil {
+		t.Skipf("no tmpfs at /dev/shm: %v", err)
+	}
+	defer os.Remove(pagesFile.Name())
+	defer pagesFile.Close()
+	sinks := fileSinks{f: pagesFile}
+	var meta bytes.Buffer
+	if err := f.SaveTo(context.Background(), &meta, &SaveOpts{Precopy: &PrecopySaveOpts{Sinks: sinks}}); err != nil {
+		t.Fatalf("SaveTo: %v", err)
+	}
+
+	restored := newSaveTestMemoryFile(t, false)
+	readFD, err := unix.Dup(int(pagesFile.Fd()))
+	if err != nil {
+		t.Fatalf("dup: %v", err)
+	}
+	done := make(chan error, 1)
+	apfl, err := StartAsyncPagesFileLoad(stateio.NewPagesFileFDReaderDefault(int32(readFD)), func(err error) { done <- err }, nil)
+	if err != nil {
+		t.Fatalf("StartAsyncPagesFileLoad: %v", err)
+	}
+	apfl.HoldBulkLoading()
+	if err := restored.LoadFrom(context.Background(), &meta, &LoadOpts{PagesFile: apfl, PagesFileAtFileOffsets: true}); err != nil {
+		t.Fatalf("LoadFrom: %v", err)
+	}
+	apfl.MemoryFilesDone()
+
+	// An awaited page is loaded while bulk loading is held.
+	page := memmap.FileRange{Start: r.Start + 40*pg, End: r.Start + 41*pg}
+	ims, err := restored.MapInternal(page, hostarch.Read)
+	if err != nil {
+		t.Fatalf("MapInternal: %v", err)
+	}
+	if b := ims.Head().ToSlice()[0]; b != 41 {
+		t.Errorf("awaited page: got first byte %d, want 41", b)
+	}
+	select {
+	case err := <-done:
+		t.Fatalf("loading completed (%v) while bulk loading was held", err)
+	default:
+	}
+	if !restored.IsAsyncLoading() {
+		t.Errorf("all pages loaded while bulk loading was held")
+	}
+
+	apfl.ReleaseBulkLoading()
+	if err := <-done; err != nil {
+		t.Fatalf("async page loading: %v", err)
+	}
+	restored.forEachMappingSlice(r, func(bs []byte) {
+		for i := uint64(0); i < 64; i++ {
+			if got, want := bs[i*pg], byte(i+1); got != want {
+				t.Errorf("page %d: got first byte %d, want %d", i, got, want)
+			}
+		}
+	})
+}

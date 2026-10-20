@@ -434,6 +434,9 @@ func (cm *containerManager) Restore(o *sentryapi.RestoreOpts, _ *struct{}) (retE
 			// MemoryFile offset.
 			PagesFileAtFileOffsets: cm.restorer.metadata[precopy.MetadataKey] == precopy.MetadataValue,
 		}
+		// A migrated sandbox should run again as soon as possible: load its
+		// pages in bulk only once the kernel is restored.
+		mflOpts.HoldBulkLoading = mflOpts.PagesFileAtFileOffsets && o.Background
 		cm.restorer.asyncMFLoader = kernel.NewAsyncMFLoaderWithOpts(pagesMetadata, pagesFile, cm.restorer.mainMF, timer.Fork("PagesFileLoader"), mflOpts) // transfers ownership
 		pagesMetadata = nil
 		pagesFile = nil

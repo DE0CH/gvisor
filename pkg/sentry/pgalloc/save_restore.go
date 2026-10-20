@@ -1365,6 +1365,10 @@ type AsyncPagesFileLoad struct {
 	// priority is protected by mu.
 	priority ringdeque.Deque[aplFileRange]
 
+	// If bulkHeld is true, only pages with waiters are loaded; see
+	// HoldBulkLoading.
+	bulkHeld atomic.Bool
+
 	// lfStatus communicates MemoryFile.LoadFrom() state to the async page
 	// loader goroutine.
 	lfStatus syncevent.Waiter
@@ -1438,6 +1442,7 @@ type AsyncPagesFileLoad struct {
 const (
 	aplLFPending syncevent.Set = 1 << iota
 	aplLFDone
+	aplLFBulk
 )
 
 type aplFileRange struct {
@@ -1584,6 +1589,21 @@ func StartAsyncPagesFileLoad(ar stateio.AsyncReader, doneCallback func(error), t
 	return apfl, nil
 }
 
+// HoldBulkLoading makes apfl load only pages that are waited for, until
+// ReleaseBulkLoading is called. It is used to keep loading of pages that
+// aren't needed yet from competing for CPU with the rest of restore.
+func (apfl *AsyncPagesFileLoad) HoldBulkLoading() {
+	apfl.bulkHeld.Store(true)
+}
+
+// ReleaseBulkLoading ends the effect of HoldBulkLoading. It has no effect if
+// bulk loading is not held.
+func (apfl *AsyncPagesFileLoad) ReleaseBulkLoading() {
+	if apfl.bulkHeld.Swap(false) {
+		apfl.lfStatus.Notify(aplLFBulk)
+	}
+}
+
 // MemoryFilesDone must be called after calling LoadFrom() for all MemoryFiles
 // loading from apfl. MemoryFilesDone may be called multiple times; subsequent
 // calls have no effect.
@@ -1645,6 +1665,10 @@ func (amfl *asyncMemoryFileLoad) awaitLoad(fr memmap.FileRange) error {
 			apfl.bytesWaited += ullen
 			if !ul.started {
 				apfl.priority.PushBack(aplFileRange{amfl, ulFR})
+				if apfl.bulkHeld.Load() {
+					// The main loop may be idle; see its "out of work" case.
+					apfl.lfStatus.Notify(aplLFPending)
+				}
 			}
 			if logAwaitedLoads {
 				log.Infof("MemoryFile(%p): prioritize %v", amfl.f, ulFR)
@@ -1973,7 +1997,7 @@ func (apfl *AsyncPagesFileLoad) main() {
 		}
 		apfl.mu.Unlock()
 		// Fill remaining queue with reads for pages with no waiters.
-		if apfl.canEnqueue() {
+		if apfl.canEnqueue() && !apfl.bulkHeld.Load() {
 			apfl.amflsMu.Lock()
 			// Unawaited loads from earlier MemoryFiles are prioritized over
 			// unawaited loads from later MemoryFiles. Callers of
@@ -2031,11 +2055,23 @@ func (apfl *AsyncPagesFileLoad) main() {
 
 		if apfl.qavail == maxParallel {
 			// We are out of work to do.
-			ev := apfl.lfStatus.Wait()
+			waitFor := syncevent.AllEvents
+			if apfl.bulkHeld.Load() {
+				// Unloaded pages remain, so aplLFDone doesn't mean that
+				// loading is complete; wait for waiters or the release of
+				// bulk loading instead.
+				waitFor = aplLFPending | aplLFBulk
+			}
+			ev := apfl.lfStatus.WaitFor(waitFor)
 			if ev&aplLFPending != 0 {
 				// We may have raced with MemoryFile.LoadFrom() inserting into
-				// asyncMemoryFileLoad.unloaded.
+				// asyncMemoryFileLoad.unloaded, or a waiter may have been
+				// added while bulk loading is held.
 				apfl.lfStatus.Ack(aplLFPending)
+				continue
+			}
+			if ev&aplLFBulk != 0 {
+				apfl.lfStatus.Ack(aplLFBulk)
 				continue
 			}
 			if ev&aplLFDone != 0 {
