@@ -927,8 +927,13 @@ exitLoop:
 var hostWriteThreshold = 16 * uint64(hostarch.PageSize)
 
 func (rw *regularFileReadWriter) writeToMF(fr memmap.FileRange, srcs safemem.BlockSeq) (uint64, error) {
-	if rw.file.inode.fs.mf.IsDiskBacked() && fr.Length() >= hostWriteThreshold {
-		fd, err := rw.file.inode.fs.mf.DataFD(fr)
+	mf := rw.file.inode.fs.mf
+	// The write is complete when this function returns, so mark fr dirty for
+	// pre-copy migration afterwards rather than using MapInternal's
+	// conservative tracking.
+	defer mf.MarkDirty(fr)
+	if mf.IsDiskBacked() && fr.Length() >= hostWriteThreshold {
+		fd, err := mf.DataFD(fr)
 		if err != nil {
 			return 0, err
 		}
@@ -940,7 +945,7 @@ func (rw *regularFileReadWriter) writeToMF(fr memmap.FileRange, srcs safemem.Blo
 		)
 	}
 	// Get internal mappings.
-	ims, err := rw.file.inode.fs.mf.MapInternal(fr, hostarch.Write)
+	ims, err := mf.MapInternalUntracked(fr, hostarch.Write)
 	if err != nil {
 		return 0, err
 	}

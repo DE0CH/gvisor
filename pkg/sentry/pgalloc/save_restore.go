@@ -182,6 +182,21 @@ type SaveOpts struct {
 	// but may instead improve SaveTo() and LoadFrom() time, and checkpoint
 	// size, if the application has many committed zero pages.
 	ExcludeCommittedZeroPages bool
+
+	// If Precopy is not nil, page contents are sent to Precopy.Sink instead
+	// of being written to PagesFile or w, and only pages that may differ from
+	// what was sent while dirty tracking was enabled are sent. PagesFile must
+	// be nil.
+	Precopy *PrecopySaveOpts
+}
+
+// PrecopySaveOpts holds options for the final save of pre-copy migration.
+type PrecopySaveOpts struct {
+	// Sink receives page contents.
+	Sink PrecopySink
+
+	// Stats accumulates the amount of page contents sent to Sink.
+	Stats PrecopyStats
 }
 
 // SaveTo writes f's state to the given stream.
@@ -202,6 +217,10 @@ func (f *MemoryFile) SaveTo(ctx context.Context, w io.Writer, opts *SaveOpts) er
 	// Ensure that there are no pending evictions.
 	if len(f.evictable) != 0 {
 		panic(fmt.Sprintf("evictions still pending for %d users; call StartEvictions and WaitForEvictions before SaveTo", len(f.evictable)))
+	}
+
+	if opts.Precopy != nil && opts.PagesFile != nil {
+		return fmt.Errorf("pre-copy save can't use a pages file")
 	}
 
 	// Register this MemoryFile with async page saving if a pages file has been
@@ -527,7 +546,24 @@ func (f *MemoryFile) SaveTo(ctx context.Context, w io.Writer, opts *SaveOpts) er
 	}
 	log.Infof("MemoryFile(%p): saved metadata in %s", f, time.Duration(gohacks.Nanotime()-timeMetadataStart))
 
-	if amfs == nil {
+	if opts.Precopy != nil {
+		// Send only the committed pages that the destination may not have
+		// yet: all of them if f was not tracked, otherwise those that were
+		// written since they were last sent. Pages that are not committed
+		// are not loaded on restore, so their contents don't matter.
+		timePagesStart := gohacks.Nanotime()
+		committed := f.memAcctRangesLocked(true /* committedOnly */)
+		frs := committed
+		if f.IsDirtyTracking() {
+			frs = IntersectRanges(UnionRanges(f.TakeDirty(), f.StickyDirty()), committed)
+		}
+		stats, err := f.SendRanges(frs, opts.Precopy.Sink)
+		opts.Precopy.Stats.Add(stats)
+		if err != nil {
+			return fmt.Errorf("failed to send pages: %w", err)
+		}
+		log.Infof("MemoryFile(%p): sent %d bytes of pages and %d bytes of zero ranges (of %d committed bytes) in %s", f, stats.DataBytes, stats.ZeroBytes, f.knownCommittedBytes, time.Duration(gohacks.Nanotime()-timePagesStart))
+	} else if amfs == nil {
 		// Save committed pages.
 		ww := wire.Writer{Writer: w}
 		timePagesStart := gohacks.Nanotime()
@@ -1091,6 +1127,12 @@ type LoadOpts struct {
 	PagesFileOffset uint64
 	DoneCallback    func(error)
 
+	// If PagesFileAtFileOffsets is true, PagesFile was written by pre-copy
+	// migration: the contents of the page at MemoryFile offset off are at
+	// PrecopyPagesFileOffset(ResourceID) + off in PagesFile, and
+	// PagesFileOffset is unused.
+	PagesFileAtFileOffsets bool
+
 	// Optional timeline for the restore process.
 	// If async page loading is enabled, a forked timeline will be created, so
 	// ownership of this timeline remains in the hands of the caller of
@@ -1108,6 +1150,10 @@ func (f *MemoryFile) LoadFrom(ctx context.Context, r io.Reader, opts *LoadOpts) 
 			opts.DoneCallback(err)
 		}
 	}()
+
+	if opts.PagesFileAtFileOffsets && opts.PagesFile == nil {
+		return fmt.Errorf("pre-copy pages file layout requires a pages file")
+	}
 
 	// Load metadata.
 	timeMetadataStart := gohacks.Nanotime()
@@ -1248,12 +1294,17 @@ func (f *MemoryFile) LoadFrom(ctx context.Context, r io.Reader, opts *LoadOpts) 
 				minUnloadedInit = true
 				amfl.minUnloaded.Store(maFR.Start)
 			}
+			off := opts.PagesFileOffset
+			if opts.PagesFileAtFileOffsets {
+				off = PrecopyPagesFileOffset(f.opts.ResourceID) + maFR.Start
+			} else {
+				opts.PagesFileOffset += amount
+			}
 			amfl.pf.mu.Lock()
 			amfl.unloaded.InsertRange(maFR, aplUnloadedInfo{
-				off: opts.PagesFileOffset,
+				off: off,
 			})
 			amfl.pf.mu.Unlock()
-			opts.PagesFileOffset += amount
 			amfl.pf.lfStatus.Notify(aplLFPending)
 		} else {
 			// Verify header.

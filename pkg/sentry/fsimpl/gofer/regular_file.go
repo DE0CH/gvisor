@@ -517,14 +517,17 @@ func (rw *dentryReadWriter) WriteFromBlocks(srcs safemem.BlockSeq) (uint64, erro
 		case seg.Ok():
 			// Get internal mappings from the cache.
 			segMR := seg.Range().Intersect(mr)
-			ims, err := mf.MapInternal(seg.FileRangeOf(segMR), hostarch.Write)
+			segFR := seg.FileRangeOf(segMR)
+			ims, err := mf.MapInternalUntracked(segFR, hostarch.Write)
 			if err != nil {
 				retErr = err
 				goto exitLoop
 			}
 
-			// Copy to internal mappings.
+			// Copy to internal mappings. The write is complete once CopySeq
+			// returns, so it can be marked dirty for pre-copy migration then.
 			n, err := safemem.CopySeq(ims, srcs)
+			mf.MarkDirty(segFR)
 			done += n
 			rw.off += n
 			srcs = srcs.DropFirst64(n)

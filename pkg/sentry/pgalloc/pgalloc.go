@@ -206,6 +206,9 @@ type MemoryFile struct {
 	// failed async page loading.
 	asyncPageLoad atomic.Pointer[asyncMemoryFileLoad]
 
+	// If dirty is non-nil, dirty tracking is enabled; see dirty.go.
+	dirty atomic.Pointer[dirtyTracker]
+
 	// file is the backing file. The file pointer is immutable.
 	file *os.File
 
@@ -686,7 +689,7 @@ func (f *MemoryFile) Allocate(length uint64, opts AllocOpts) (memmap.FileRange, 
 				return memmap.FileRange{}, err
 			}
 		case AllocateAndWritePopulate:
-			dsts, err = f.MapInternal(fr, hostarch.Write)
+			dsts, err = f.mapInternal(fr, hostarch.Write)
 			if err != nil {
 				f.DecRef(fr)
 				return memmap.FileRange{}, err
@@ -703,7 +706,7 @@ func (f *MemoryFile) Allocate(length uint64, opts AllocOpts) (memmap.FileRange, 
 			}
 			if alloc.recycled {
 				// The contents of recycled waste pages are initially unknown, so we
-				// need to zero them.
+				// need to zero them. (manuallyZero marks fr dirty.)
 				f.manuallyZero(fr)
 			} else if needHugeTouch {
 				// We only need to touch a single byte in each huge page.
@@ -719,13 +722,14 @@ func (f *MemoryFile) Allocate(length uint64, opts AllocOpts) (memmap.FileRange, 
 	}
 	if alloc.opts.ReaderFunc != nil {
 		if dsts.IsEmpty() {
-			dsts, err = f.MapInternal(fr, hostarch.Write)
+			dsts, err = f.mapInternal(fr, hostarch.Write)
 			if err != nil {
 				f.DecRef(fr)
 				return memmap.FileRange{}, err
 			}
 		}
 		n, err := safemem.ReadFullToBlocks(alloc.opts.ReaderFunc, dsts)
+		f.MarkDirty(fr)
 		un := uint64(hostarch.Addr(n).RoundDown())
 		if un < length {
 			// Free unused memory and update fr to contain only the memory that is
@@ -1090,17 +1094,22 @@ func (f *MemoryFile) decommitFile(fr memmap.FileRange) error {
 	// "After a successful call, subsequent reads from this range will
 	// return zeroes. The FALLOC_FL_PUNCH_HOLE flag must be ORed with
 	// FALLOC_FL_KEEP_SIZE in mode ..." - fallocate(2)
-	return unix.Fallocate(
+	err := unix.Fallocate(
 		int(f.file.Fd()),
 		unix.FALLOC_FL_PUNCH_HOLE|unix.FALLOC_FL_KEEP_SIZE,
 		int64(fr.Start),
 		int64(fr.Length()))
+	if err == nil {
+		f.MarkDirty(fr)
+	}
+	return err
 }
 
 func (f *MemoryFile) manuallyZero(fr memmap.FileRange) {
 	f.forEachMappingSlice(fr, func(bs []byte) {
 		clear(bs)
 	})
+	f.MarkDirty(fr)
 }
 
 func (f *MemoryFile) decommitOrManuallyZero(fr memmap.FileRange) {
@@ -1442,7 +1451,17 @@ func (f *MemoryFile) releaseLocked(fr memmap.FileRange, huge bool) {
 }
 
 // MapInternal implements memmap.File.MapInternal.
+//
+// If dirty tracking is enabled and at.Write is true, pages in fr are treated as
+// written until dirty tracking stops; see dirty.go.
 func (f *MemoryFile) MapInternal(fr memmap.FileRange, at hostarch.AccessType) (safemem.BlockSeq, error) {
+	if at.Write {
+		f.markDirtySticky(fr)
+	}
+	return f.mapInternal(fr, at)
+}
+
+func (f *MemoryFile) mapInternal(fr memmap.FileRange, at hostarch.AccessType) (safemem.BlockSeq, error) {
 	if !fr.WellFormed() || fr.Length() == 0 {
 		panic(fmt.Sprintf("invalid range: %v", fr))
 	}

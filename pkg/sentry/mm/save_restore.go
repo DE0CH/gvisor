@@ -53,6 +53,7 @@ func (mm *MemoryManager) afterLoad(ctx goContext.Context) {
 			panic(fmt.Sprintf("failed to create AddressSpace after restore: %v", err))
 		}
 		mm.as = as
+		registerMemoryManager(mm)
 	}
 }
 

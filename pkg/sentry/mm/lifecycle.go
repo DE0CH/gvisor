@@ -37,7 +37,7 @@ func NewMemoryManager(p platform.Platform, mf *pgalloc.MemoryFile) (*MemoryManag
 	if err != nil {
 		return nil, err
 	}
-	return &MemoryManager{
+	mm := &MemoryManager{
 		p:           p,
 		mf:          mf,
 		haveASIO:    p.SupportsAddressSpaceIO(),
@@ -46,7 +46,9 @@ func NewMemoryManager(p platform.Platform, mf *pgalloc.MemoryFile) (*MemoryManag
 		auxv:        arch.Auxv{},
 		dumpability: atomicbitops.FromInt32(int32(UserDumpable)),
 		aioManager:  aioManager{contexts: make(map[uint64]*AIOContext)},
-	}, nil
+	}
+	registerMemoryManager(mm)
+	return mm, nil
 }
 
 // SetMmapLayout initializes mm's layout from the given arch.Context64.
@@ -366,6 +368,7 @@ func (mm *MemoryManager) Fork(ctx context.Context) (*MemoryManager, error) {
 		mm2.executable.IncRef()
 		mm2.executable.DenyWriteAccess()
 	}
+	registerMemoryManager(mm2)
 	return mm2, nil
 }
 
@@ -442,6 +445,7 @@ func (mm *MemoryManager) DecUsers(ctx context.Context) {
 		panic(fmt.Sprintf("Invalid MemoryManager.users: %d", users))
 	}
 
+	unregisterMemoryManager(mm)
 	mm.destroyAIOManager(ctx)
 
 	mm.metadataMu.Lock()
