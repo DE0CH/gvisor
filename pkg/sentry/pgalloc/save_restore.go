@@ -192,8 +192,8 @@ type SaveOpts struct {
 
 // PrecopySaveOpts holds options for the final save of pre-copy migration.
 type PrecopySaveOpts struct {
-	// Sink receives page contents.
-	Sink PrecopySink
+	// Sinks receives page contents.
+	Sinks PrecopySinks
 
 	// Stats accumulates the amount of page contents sent to Sink.
 	Stats PrecopyStats
@@ -557,7 +557,7 @@ func (f *MemoryFile) SaveTo(ctx context.Context, w io.Writer, opts *SaveOpts) er
 		if f.IsDirtyTracking() {
 			frs = IntersectRanges(UnionRanges(f.TakeDirty(), f.StickyDirty()), committed)
 		}
-		stats, err := f.SendRanges(frs, opts.Precopy.Sink)
+		stats, err := f.SendRanges(frs, opts.Precopy.Sinks.MemoryFileSink(f.opts.ResourceID))
 		opts.Precopy.Stats.Add(stats)
 		if err != nil {
 			return fmt.Errorf("failed to send pages: %w", err)

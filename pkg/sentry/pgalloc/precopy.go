@@ -21,6 +21,7 @@ import (
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/sentry/checkpoint"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
+	"gvisor.dev/gvisor/pkg/sync"
 )
 
 // Pre-copy live migration (see kernel.Kernel.Precopy) sends MemoryFile pages
@@ -63,6 +64,13 @@ type PrecopySink interface {
 
 	// WriteZero sends that the given page-aligned range contains only zeroes.
 	WriteZero(off, length uint64) error
+}
+
+// PrecopySinks provides the PrecopySink for each MemoryFile.
+type PrecopySinks interface {
+	// MemoryFileSink returns the sink for pages of the MemoryFile with the
+	// given resource ID (the zero ResourceID for the main MemoryFile).
+	MemoryFileSink(id checkpoint.ResourceID) PrecopySink
 }
 
 // PrecopyStats counts bytes sent by MemoryFile.SendRanges.
@@ -120,6 +128,30 @@ func IntersectRanges(a, b []memmap.FileRange) []memmap.FileRange {
 			a = a[1:]
 		} else {
 			b = b[1:]
+		}
+	}
+	return out
+}
+
+// SubtractRanges returns the ranges in a that are not in b, where a and b are
+// each in increasing order and non-overlapping, in increasing order.
+func SubtractRanges(a, b []memmap.FileRange) []memmap.FileRange {
+	var out []memmap.FileRange
+	for _, r := range a {
+		for len(b) != 0 && b[0].End <= r.Start {
+			b = b[1:]
+		}
+		for i := 0; i < len(b) && b[i].Start < r.End; i++ {
+			if b[i].Start > r.Start {
+				out = append(out, memmap.FileRange{Start: r.Start, End: b[i].Start})
+			}
+			r.Start = max(r.Start, b[i].End)
+			if r.Start >= r.End {
+				break
+			}
+		}
+		if r.Start < r.End {
+			out = append(out, r)
 		}
 	}
 	return out
@@ -300,4 +332,41 @@ func (f *MemoryFile) SendRanges(frs []memmap.FileRange, sink PrecopySink) (Preco
 		return stats, err
 	}
 	return stats, flushData()
+}
+
+// privateMemoryFiles holds MemoryFiles that have a resource ID and haven't
+// been destroyed, so that pre-copy migration can find them while the kernel
+// runs.
+var privateMemoryFiles struct {
+	mu  sync.Mutex
+	mfs map[*MemoryFile]struct{}
+}
+
+func registerPrivateMemoryFile(f *MemoryFile) {
+	privateMemoryFiles.mu.Lock()
+	defer privateMemoryFiles.mu.Unlock()
+	if privateMemoryFiles.mfs == nil {
+		privateMemoryFiles.mfs = make(map[*MemoryFile]struct{})
+	}
+	privateMemoryFiles.mfs[f] = struct{}{}
+}
+
+func unregisterPrivateMemoryFile(f *MemoryFile) {
+	privateMemoryFiles.mu.Lock()
+	defer privateMemoryFiles.mu.Unlock()
+	delete(privateMemoryFiles.mfs, f)
+}
+
+// ForEachPrivateMemoryFile calls fn for every MemoryFile that was created with
+// a resource ID and hasn't been destroyed.
+func ForEachPrivateMemoryFile(fn func(*MemoryFile)) {
+	privateMemoryFiles.mu.Lock()
+	mfs := make([]*MemoryFile, 0, len(privateMemoryFiles.mfs))
+	for mf := range privateMemoryFiles.mfs {
+		mfs = append(mfs, mf)
+	}
+	privateMemoryFiles.mu.Unlock()
+	for _, mf := range mfs {
+		fn(mf)
+	}
 }

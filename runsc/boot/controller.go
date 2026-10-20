@@ -39,6 +39,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/socket/plugin"
 	"gvisor.dev/gvisor/pkg/sentry/state"
 	"gvisor.dev/gvisor/pkg/sentry/state/checkpointfiles"
+	"gvisor.dev/gvisor/pkg/sentry/state/precopy"
 	"gvisor.dev/gvisor/pkg/sentry/state/stateio"
 	"gvisor.dev/gvisor/pkg/sentry/state/stateipc"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
@@ -419,20 +420,27 @@ func (cm *containerManager) Restore(o *sentryapi.RestoreOpts, _ *struct{}) (retE
 	}
 	timer.Reached("created MemoryFile")
 
-	if o.HavePagesFile {
-		// This immediately starts loading the main MemoryFile asynchronously.
-		cm.restorer.asyncMFLoader = kernel.NewAsyncMFLoader(pagesMetadata, pagesFile, cm.restorer.mainMF, timer.Fork("PagesFileLoader")) // transfers ownership
-		pagesMetadata = nil
-		pagesFile = nil
-		timer.Reached("created async MF loader")
-	}
-
 	cm.restorer.stateFile, cm.restorer.metadata, err = state.NewStatefileReader(stateFile /* transfers ownership on success */, nil)
 	if err != nil {
 		return fmt.Errorf("creating statefile reader: %w", err)
 	}
 	stateFile = nil
 	timer.Reached("created statefile reader")
+
+	if o.HavePagesFile {
+		// This immediately starts loading the main MemoryFile asynchronously.
+		mflOpts := kernel.AsyncMFLoaderOpts{
+			// Images written by pre-copy migration store pages by
+			// MemoryFile offset.
+			PagesFileAtFileOffsets: cm.restorer.metadata[precopy.MetadataKey] == precopy.MetadataValue,
+		}
+		cm.restorer.asyncMFLoader = kernel.NewAsyncMFLoaderWithOpts(pagesMetadata, pagesFile, cm.restorer.mainMF, timer.Fork("PagesFileLoader"), mflOpts) // transfers ownership
+		pagesMetadata = nil
+		pagesFile = nil
+		timer.Reached("created async MF loader")
+	} else if v, ok := cm.restorer.metadata[precopy.MetadataKey]; ok {
+		return fmt.Errorf("checkpoint written by pre-copy migration (%s=%s) requires a pages file", precopy.MetadataKey, v)
+	}
 
 	cm.l.restoreDone = sync.NewCond(&cm.l.mu)
 	cm.l.state = restoringUnstarted

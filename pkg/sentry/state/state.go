@@ -25,6 +25,7 @@ import (
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
+	"gvisor.dev/gvisor/pkg/sentry/state/precopy"
 	"gvisor.dev/gvisor/pkg/sentry/state/stateio"
 	"gvisor.dev/gvisor/pkg/sentry/watchdog"
 	"gvisor.dev/gvisor/pkg/state/statefile"
@@ -84,6 +85,13 @@ type SaveOpts struct {
 	// FSSaveOpts contains options for filesystem checkpoint. If non-nil, we
 	// should split filesystem to separate pages from the full checkpoint.
 	FSSaveOpts *kernel.FSSaveOpts
+
+	// If Precopy is not nil, Save performs pre-copy live migration: memory is
+	// sent to Precopy.Stream while the sandbox keeps running, then the
+	// sandbox is stopped and saved to Destination and PagesMetadata, which
+	// must write to the same stream, and PagesFile must be nil. If the stream
+	// has an io.Closer, Close closes it.
+	Precopy *kernel.PrecopyOpts
 }
 
 // Close releases resources owned by opts.
@@ -104,6 +112,12 @@ func (opts *SaveOpts) Close() error {
 	if opts.FSSaveOpts != nil {
 		err = errors.Join(err, opts.FSSaveOpts.Close())
 	}
+	if opts.Precopy != nil {
+		if c, ok := opts.Precopy.Stream.(io.Closer); ok {
+			err = errors.Join(err, c.Close())
+		}
+		opts.Precopy = nil
+	}
 	return err
 }
 
@@ -123,6 +137,23 @@ func (opts *SaveOpts) Save(ctx context.Context, k *kernel.Kernel, w *watchdog.Wa
 	} else {
 		wt = curTime.Sub(opts.StartTime)
 		log.Infof("Before save wall time: %s", wt.String())
+	}
+
+	if opts.Precopy != nil {
+		// Copy memory while the sandbox keeps running. If this fails, the
+		// sandbox is unaffected.
+		log.Infof("Pre-copy migration started (downtime target %s, at most %d rounds)", opts.Precopy.Downtime, opts.Precopy.MaxRounds)
+		if err := k.Precopy(ctx, *opts.Precopy); err != nil {
+			return fmt.Errorf("pre-copy failed: %w", err)
+		}
+		defer func() {
+			stats := k.PrecopyDone()
+			log.Infof("Pre-copy migration: %d live rounds sent %d bytes in %s; %d bytes sent while stopped", stats.Rounds, stats.LiveBytes, stats.LiveDuration, stats.FinalBytes)
+		}()
+		if opts.Metadata == nil {
+			opts.Metadata = make(map[string]string)
+		}
+		opts.Metadata[precopy.MetadataKey] = precopy.MetadataValue
 	}
 
 	log.Infof("Sandbox save started, pausing all tasks.")
@@ -171,6 +202,9 @@ func (opts *SaveOpts) Save(ctx context.Context, k *kernel.Kernel, w *watchdog.Wa
 		opts.PagesMetadata = nil
 		opts.PagesFile = nil
 		opts.FSSaveOpts = nil
+		if err == nil && opts.Precopy != nil {
+			err = opts.Precopy.Stream.Finish()
+		}
 	}
 
 	t1, _ := CPUTime()

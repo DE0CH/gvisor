@@ -1881,6 +1881,21 @@ type CheckpointOpts struct {
 	SaveRestoreExecTimeout     time.Duration
 	SaveRestoreExecContainerID string
 	SplitFSCheckpointPaths     []string
+
+	// If Precopy is not nil, the sandbox is migrated with pre-copy live
+	// migration over Precopy.Stream instead of being saved to imagePath.
+	Precopy *PrecopyOpts
+}
+
+// PrecopyOpts holds options for pre-copy live migration.
+type PrecopyOpts struct {
+	// Stream is a connected stream to the destination's pre-copy receiver.
+	// Checkpoint does not take ownership of it.
+	Stream *os.File
+
+	// Downtime and MaxRounds are as in controlapi.PrecopyOpts.
+	Downtime  time.Duration
+	MaxRounds int
 }
 
 // Checkpoint sends the checkpoint call for a container in the sandbox.
@@ -1914,7 +1929,22 @@ func (s *Sandbox) Checkpoint(conf *config.Config, cid string, imagePath string, 
 		},
 	}
 	defer opt.FilePayload.Close()
-	if err := s.setCheckpointOptsFiles(conf, imagePath, opts, bundles, &opt); err != nil {
+	if opts.Precopy != nil {
+		if len(bundles) > 0 {
+			return fmt.Errorf("pre-copy migration can't be combined with filesystem checkpoints")
+		}
+		// The sentry gets its own copy of the stream; opt.FilePayload.Close
+		// closes it.
+		stream, err := dupFile(opts.Precopy.Stream)
+		if err != nil {
+			return err
+		}
+		opt.FilePayload.Files = []*os.File{stream}
+		opt.Precopy = &controlapi.PrecopyOpts{
+			Downtime:  opts.Precopy.Downtime,
+			MaxRounds: opts.Precopy.MaxRounds,
+		}
+	} else if err := s.setCheckpointOptsFiles(conf, imagePath, opts, bundles, &opt); err != nil {
 		return err
 	}
 
@@ -3232,4 +3262,13 @@ func rootfsUpperTarFlags(p string) int {
 		flags |= unix.O_NOFOLLOW
 	}
 	return flags
+}
+
+// dupFile returns a duplicate of f.
+func dupFile(f *os.File) (*os.File, error) {
+	fd, err := unix.Dup(int(f.Fd()))
+	if err != nil {
+		return nil, fmt.Errorf("dup %s: %w", f.Name(), err)
+	}
+	return os.NewFile(uintptr(fd), f.Name()), nil
 }

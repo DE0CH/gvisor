@@ -472,6 +472,9 @@ func NewMemoryFile(file *os.File, opts MemoryFileOpts) (*MemoryFile, error) {
 	if !opts.DisableIMAWorkAround {
 		hostmm.IMAWorkAroundForMemFile(file.Fd())
 	}
+	if opts.ResourceID.Ok() {
+		registerPrivateMemoryFile(f)
+	}
 	return f, nil
 }
 
@@ -495,6 +498,8 @@ func (f *MemoryFile) initFields() {
 //
 // Postconditions: None of f's methods may be called after Destroy.
 func (f *MemoryFile) Destroy() {
+	unregisterPrivateMemoryFile(f)
+	f.StopDirtyTracking()
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.destroyed = true

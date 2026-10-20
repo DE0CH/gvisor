@@ -173,6 +173,10 @@ type Kernel struct {
 	// mf provides application memory.
 	mf *pgalloc.MemoryFile `state:"nosave"`
 
+	// precopy is the state of an in-progress pre-copy migration, or nil.
+	// It is set by Precopy and cleared by PrecopyDone; see precopy.go.
+	precopy *precopySession `state:"nosave"`
+
 	// See InitKernelArgs for the meaning of these fields.
 	featureSet           cpuid.FeatureSet
 	timekeeper           *Timekeeper
@@ -971,6 +975,15 @@ func (k *Kernel) saveMemoryFiles(ctx context.Context, w io.Writer, pagesMetadata
 
 	mfOpts := pgalloc.SaveOpts{
 		ExcludeCommittedZeroPages: appMFExcludeCommittedZeroPages,
+	}
+	if k.precopy != nil {
+		if pagesFile != nil {
+			return fmt.Errorf("pre-copy migration can't save to a pages file")
+		}
+		mfOpts.Precopy = &pgalloc.PrecopySaveOpts{Sinks: k.precopy.opts.Stream}
+		defer func() {
+			k.precopy.stats.FinalBytes += mfOpts.Precopy.Stats.DataBytes
+		}()
 	}
 	var (
 		asyncPageSaveWg      sync.WaitGroup

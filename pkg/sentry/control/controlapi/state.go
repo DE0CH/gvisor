@@ -76,6 +76,24 @@ type SaveOpts struct {
 
 	// RunscVersion is the runsc binary version.
 	RunscVersion string `json:"runsc_version"`
+
+	// If Precopy is not nil, the sandbox is checkpointed by pre-copy live
+	// migration: the first and only file in FilePayload is a connected
+	// stream (such as a TCP socket) to a pre-copy receiver on the
+	// destination (`runsc migrate-receive`), and the checkpoint image is
+	// written there. HavePagesFile and UseCheckpointGofer must be false.
+	Precopy *PrecopyOpts `json:"precopy"`
+}
+
+// PrecopyOpts contains options for pre-copy live migration.
+type PrecopyOpts struct {
+	// Downtime is the target duration for sending the last dirty pages while
+	// the sandbox is stopped.
+	Downtime time.Duration `json:"downtime"`
+
+	// MaxRounds is the maximum number of pre-copy rounds after the first
+	// full copy.
+	MaxRounds int `json:"max_rounds"`
 }
 
 // SaveRestoreExecOpts contains options for executing a binary
