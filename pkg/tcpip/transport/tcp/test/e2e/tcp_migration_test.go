@@ -180,6 +180,80 @@ func TestTCPMigration(t *testing.T) {
 	}
 }
 
+// TestTCPMigrationRepeated tests that an established connection survives
+// several consecutive save/restore cycles when live TCP migration is allowed.
+// Unlike TestTCPMigration, the restored stacks are not told again that live
+// migration is allowed, as is the case for a stack restored by the sentry: the
+// setting must travel with the saved stack, or the connection is aborted on
+// the second save.
+func TestTCPMigrationRepeated(t *testing.T) {
+	c := testcontext.New(t, e2e.DefaultMTU)
+	defer c.Cleanup()
+
+	c.Stack().SetAllowLiveTCPMigration(true)
+	c.CreateConnected(testcontext.TestInitialSequenceNumber, 30000, -1 /* epRcvBuf */)
+
+	s, ep := c.Stack(), c.EP
+	for i := 1; i <= 4; i++ {
+		// Save with removeConf, as a checkpoint that does not resume does.
+		s.SetRemoveConf(true)
+		var buf bytes.Buffer
+		if _, err := state.Save(context.Background(), &buf, s); err != nil {
+			t.Fatalf("save %d: %v", i, err)
+		}
+		if got, want := tcp.EndpointState(ep.State()), tcp.StateEstablished; got != want {
+			t.Fatalf("save %d: endpoint state after save: got %v, want %v", i, got, want)
+		}
+
+		restoredStack := stack.New(stack.Options{
+			TransportProtocols: []stack.TransportProtocolFactory{tcp.NewProtocol},
+			NetworkProtocols:   []stack.NetworkProtocolFactory{ipv4.NewProtocol, ipv6.NewProtocol},
+		})
+		defer restoredStack.Destroy()
+		if _, err := state.Load(context.Background(), bytes.NewReader(buf.Bytes()), restoredStack); err != nil {
+			t.Fatalf("load %d: %v", i, err)
+		}
+		if !restoredStack.AllowLiveTCPMigration() {
+			t.Fatalf("load %d: restored stack does not allow live TCP migration", i)
+		}
+		// Recreate NIC 1 with the same address, as the restoring sandbox does.
+		if err := restoredStack.CreateNIC(1, channel.New(1000, e2e.DefaultMTU, "")); err != nil {
+			t.Fatalf("load %d: CreateNIC: %v", i, err)
+		}
+		if err := restoredStack.AddProtocolAddress(1, tcpip.ProtocolAddress{
+			Protocol:          header.IPv4ProtocolNumber,
+			AddressWithPrefix: testcontext.StackAddrWithPrefix,
+		}, stack.AddressProperties{}); err != nil {
+			t.Fatalf("load %d: AddProtocolAddress: %v", i, err)
+		}
+		restoredStack.SetRouteTable([]tcpip.Route{{Destination: header.IPv4EmptySubnet, NIC: 1}})
+
+		restoredEndpoints := restoredEndpointsOf(t, restoredStack)
+		if len(restoredEndpoints) != 1 {
+			t.Fatalf("load %d: got %d restored endpoints, want 1", i, len(restoredEndpoints))
+		}
+		restoredEP, ok := restoredEndpoints[0].(tcpip.Endpoint)
+		if !ok {
+			t.Fatalf("load %d: restored endpoint does not implement tcpip.Endpoint", i)
+		}
+		restoredStack.Restore()
+		if got, want := tcp.EndpointState(restoredEP.State()), tcp.StateEstablished; got != want {
+			t.Fatalf("restore %d: endpoint state: got %v, want %v", i, got, want)
+		}
+		s, ep = restoredStack, restoredEP
+	}
+}
+
+// restoredEndpointsOf returns the endpoints s will restore on s.Restore().
+func restoredEndpointsOf(t *testing.T, s *stack.Stack) []stack.RestoredEndpoint {
+	t.Helper()
+	sf, ok := reflect.TypeOf(s).Elem().FieldByName("restoredEndpoints")
+	if !ok {
+		t.Fatalf("Field restoredEndpoints not found")
+	}
+	return *(*[]stack.RestoredEndpoint)(unsafe.Pointer(uintptr(unsafe.Pointer(s)) + sf.Offset))
+}
+
 // TestRestoreListenWithPreexistingConnection tests that a listening endpoint
 // properly enters StateListen and accepts new connections after restore, even
 // when the snapshot contained active or lingering connected TCP endpoints (e.g.

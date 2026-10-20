@@ -1069,6 +1069,9 @@ func (l *Loader) ConfigureNetwork(s inet.Stack) error {
 	if nftables.IsNFTablesEnabled() && eps.Stack.NFTables() == nil {
 		eps.Stack.SetNFTables(nftables.NewNFTables(eps.Stack, eps.Stack.Clock(), eps.Stack.SecureRNG()))
 	}
+	// The restored stack carries the setting from the checkpointed sandbox;
+	// the restoring sandbox's configuration takes precedence.
+	eps.Stack.SetAllowLiveTCPMigration(l.root.conf.AllowLiveTCPMigration)
 	n := &Network{
 		Stack:  eps.Stack,
 		Kernel: l.k,
