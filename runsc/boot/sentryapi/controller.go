@@ -116,11 +116,18 @@ type RestoreOpts struct {
 	// 1. checkpoint state file.
 	// 2. optional checkpoint pages metadata file.
 	// 3. optional checkpoint pages file.
-	// 4. optional platform device file.
+	// 4. optional main MemoryFile backing file (if HaveMemoryFile).
+	// 5. optional platform device file.
 	urpc.FilePayload
 	HavePagesFile  bool
 	HaveDeviceFile bool
 	Background     bool
+
+	// If HaveMemoryFile is true, FilePayload includes a file that already
+	// holds the main MemoryFile's pages at their offsets (written by pre-copy
+	// migration), which the restored sandbox uses as its main MemoryFile's
+	// backing file instead of loading pages into a new one.
+	HaveMemoryFile bool `json:"have_memory_file"`
 
 	// If UseCheckpointGofer is true, the first file in FilePayload is a Unix
 	// domain socket connected to a URPC server implementing

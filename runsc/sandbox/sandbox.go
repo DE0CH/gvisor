@@ -55,6 +55,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/platform/platformdesc"
 	"gvisor.dev/gvisor/pkg/sentry/seccheck"
 	"gvisor.dev/gvisor/pkg/sentry/state/checkpointfiles"
+	"gvisor.dev/gvisor/pkg/sentry/state/precopy"
 	"gvisor.dev/gvisor/pkg/state/statefile"
 	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/urpc"
@@ -726,6 +727,18 @@ func (s *Sandbox) setRestoreOptsForLocalCheckpointFiles(conf *config.Config, ima
 		}
 		opt.FilePayload.Files = append(opt.FilePayload.Files, pf)
 		opt.HavePagesFile = true
+
+		// An image received by pre-copy migration also has the main
+		// MemoryFile's pages in a file that the sandbox uses directly, so it
+		// is opened for writing, outside the read-only view of the image
+		// directory.
+		mfPath := filepath.Join(imagePath, precopy.MemoryFileName)
+		if fd, err := unix.Open(mfPath, unix.O_RDWR|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0); err == nil {
+			opt.FilePayload.Files = append(opt.FilePayload.Files, os.NewFile(uintptr(fd), mfPath))
+			opt.HaveMemoryFile = true
+		} else if !errors.Is(err, unix.ENOENT) {
+			return fmt.Errorf("opening memory file %q failed: %w", path.Join(imagePath, precopy.MemoryFileName), err)
+		}
 	} else if !errors.Is(err, unix.ENOENT) {
 		return fmt.Errorf("opening pages metadata file %q failed: %w", path.Join(imagePath, checkpointfiles.PagesMetadataFileName), err)
 	} else {

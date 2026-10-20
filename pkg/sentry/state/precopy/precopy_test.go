@@ -118,25 +118,27 @@ func TestRoundTrip(t *testing.T) {
 		t.Errorf("got %d rounds (stats %d), want 1", rounds, stats.Rounds)
 	}
 
-	pf, err := os.Open(filepath.Join(dir, checkpointfiles.PagesFileName))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer pf.Close()
-	readPage := func(off uint64) []byte {
+	readPage := func(name string, off uint64) []byte {
+		f, err := os.Open(filepath.Join(dir, name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer f.Close()
 		got := make([]byte, 4096)
-		if _, err := pf.ReadAt(got, int64(off)); err != nil {
-			t.Fatalf("reading pages file at %#x: %v", off, err)
+		if _, err := f.ReadAt(got, int64(off)); err != nil {
+			t.Fatalf("reading %s at %#x: %v", name, off, err)
 		}
 		return got
 	}
-	if !bytes.Equal(readPage(0), make([]byte, 4096)) {
+	// The main MemoryFile's pages are in the memory file, others in the
+	// pages file.
+	if !bytes.Equal(readPage(MemoryFileName, 0), make([]byte, 4096)) {
 		t.Errorf("main page 0 not zeroed")
 	}
-	if !bytes.Equal(readPage(4096), page(4)) {
+	if !bytes.Equal(readPage(MemoryFileName, 4096), page(4)) {
 		t.Errorf("main page 1 has the old contents")
 	}
-	if !bytes.Equal(readPage(privBase+4096), page(3)) {
+	if !bytes.Equal(readPage(checkpointfiles.PagesFileName, privBase+4096), page(3)) {
 		t.Errorf("private page has wrong contents")
 	}
 	state, err := os.ReadFile(filepath.Join(dir, checkpointfiles.StateFileName))

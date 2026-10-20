@@ -1133,6 +1133,13 @@ type LoadOpts struct {
 	// PagesFileOffset is unused.
 	PagesFileAtFileOffsets bool
 
+	// If ContentsPresent is true, the MemoryFile's backing file already
+	// contains its saved pages at their offsets (the MemoryFile was created
+	// with MemoryFileOpts.KeepContents), so LoadFrom loads only metadata.
+	// This is the case for the main MemoryFile of a sandbox received by
+	// pre-copy migration.
+	ContentsPresent bool
+
 	// Optional timeline for the restore process.
 	// If async page loading is enabled, a forked timeline will be created, so
 	// ownership of this timeline remains in the hands of the caller of
@@ -1151,7 +1158,7 @@ func (f *MemoryFile) LoadFrom(ctx context.Context, r io.Reader, opts *LoadOpts) 
 		}
 	}()
 
-	if opts.PagesFileAtFileOffsets && opts.PagesFile == nil {
+	if opts.PagesFileAtFileOffsets && opts.PagesFile == nil && !opts.ContentsPresent {
 		return fmt.Errorf("pre-copy pages file layout requires a pages file")
 	}
 
@@ -1222,9 +1229,9 @@ func (f *MemoryFile) LoadFrom(ctx context.Context, r io.Reader, opts *LoadOpts) 
 	defer madviseWG.Wait()
 
 	// Register this MemoryFile with async page loading if a pages file has
-	// been provided.
+	// been provided, unless its pages are already present.
 	var amfl *asyncMemoryFileLoad
-	if opts.PagesFile != nil {
+	if opts.PagesFile != nil && !opts.ContentsPresent {
 		var df stateio.DestinationFile
 		if opts.PagesFile.ar.NeedRegisterDestinationFD() {
 			var err error
@@ -1288,7 +1295,9 @@ func (f *MemoryFile) LoadFrom(ctx context.Context, r io.Reader, opts *LoadOpts) 
 		for madviseEnd.Load() < maFR.End {
 			<-madviseChan
 		}
-		if amfl != nil {
+		if opts.ContentsPresent {
+			// Nothing to load.
+		} else if amfl != nil {
 			// Record where to read data.
 			if !minUnloadedInit {
 				minUnloadedInit = true
@@ -1342,7 +1351,9 @@ func (f *MemoryFile) LoadFrom(ctx context.Context, r io.Reader, opts *LoadOpts) 
 		}
 	}
 	durPages := time.Duration(gohacks.Nanotime() - timePagesStart)
-	if amfl != nil {
+	if opts.ContentsPresent {
+		log.Infof("MemoryFile(%p): %d bytes of pages already present", f, f.knownCommittedBytes)
+	} else if amfl != nil {
 		log.Infof("MemoryFile(%p): loaded page file offsets in %s; async loading %d bytes", f, durPages, f.knownCommittedBytes)
 	} else {
 		log.Infof("MemoryFile(%p): loaded pages in %s (%d bytes, %.3f MB/s)", f, durPages, f.knownCommittedBytes, float64(f.knownCommittedBytes)*1e-6/durPages.Seconds())

@@ -20,7 +20,11 @@
 //
 //   - While the source sandbox runs, MemoryFile pages are sent (repeatedly, as
 //     they are dirtied) as Pages and Zero records, addressed by their offset in
-//     the image's pages file (see pgalloc.PrecopyPagesFileOffset).
+//     a pre-copy pages file (see pgalloc.PrecopyPagesFileOffset). Receive
+//     stores the main MemoryFile's region (offsets below
+//     pgalloc.PrecopyRegionSize) in MemoryFileName, which the restored sandbox
+//     uses as its main MemoryFile's backing file, so that its pages need no
+//     loading; other regions go to the pages file.
 //
 //   - While the source sandbox is stopped, the state file and pages metadata
 //     file are sent as File records, interleaved with the last Pages and Zero
@@ -61,6 +65,10 @@ const MetadataKey = "precopy_pages_layout"
 
 // MetadataValue is the value of MetadataKey.
 const MetadataValue = "file-offset-v1"
+
+// MemoryFileName is the name of the file in a received image that holds the
+// main MemoryFile's pages at their MemoryFile offsets.
+const MemoryFileName = "memory.img"
 
 // Record types.
 const (
@@ -315,6 +323,19 @@ func Receive(r io.Reader, dir string, onRound func(round uint32, bytes uint64)) 
 		return stats, err
 	}
 	defer pages.Close()
+	memory, err := os.OpenFile(filepath.Join(dir, MemoryFileName), os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0600)
+	if err != nil {
+		return stats, err
+	}
+	defer memory.Close()
+	// fileAt returns the file and offset in it for a pre-copy pages file
+	// offset.
+	fileAt := func(off uint64) (*os.File, uint64) {
+		if off < pgalloc.PrecopyRegionSize {
+			return memory, off
+		}
+		return pages, off
+	}
 	var files [len(fileNames)]*os.File
 	for i, name := range fileNames {
 		f, err := os.OpenFile(filepath.Join(dir, name), os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
@@ -343,14 +364,16 @@ func Receive(r io.Reader, dir string, onRound func(round uint32, bytes uint64)) 
 			off := binary.LittleEndian.Uint64(hdr[0:])
 			length := binary.LittleEndian.Uint64(hdr[8:])
 			stats.PageBytes += length
+			f, foff := fileAt(off)
 			for length != 0 {
 				n := min(length, uint64(len(buf)))
 				if _, err := io.ReadFull(br, buf[:n]); err != nil {
 					return stats, unexpectedEOF(err)
 				}
-				if _, err := pages.WriteAt(buf[:n], int64(off)); err != nil {
+				if _, err := f.WriteAt(buf[:n], int64(foff)); err != nil {
 					return stats, err
 				}
+				foff += n
 				off += n
 				length -= n
 			}
@@ -361,7 +384,8 @@ func Receive(r io.Reader, dir string, onRound func(round uint32, bytes uint64)) 
 			off := binary.LittleEndian.Uint64(hdr[0:])
 			length := binary.LittleEndian.Uint64(hdr[8:])
 			stats.ZeroBytes += length
-			if err := unix.Fallocate(int(pages.Fd()), unix.FALLOC_FL_PUNCH_HOLE|unix.FALLOC_FL_KEEP_SIZE, int64(off), int64(length)); err != nil {
+			f, foff := fileAt(off)
+			if err := unix.Fallocate(int(f.Fd()), unix.FALLOC_FL_PUNCH_HOLE|unix.FALLOC_FL_KEEP_SIZE, int64(foff), int64(length)); err != nil {
 				return stats, fmt.Errorf("punching hole at %#x, length %#x: %w", off, length, err)
 			}
 		case recFile:

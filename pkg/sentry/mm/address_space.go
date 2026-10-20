@@ -46,6 +46,10 @@ func (mm *MemoryManager) UserModifiedGS(ctx context.Context) error {
 	return nil
 }
 
+// asyncLoadingMapUnit is the maximum length mapped into an AddressSpace by
+// one fault while the backing MemoryFile is being loaded asynchronously.
+const asyncLoadingMapUnit = hostarch.HugePageSize
+
 // mapASLocked maps addresses in ar into mm.as. at is the access to ar that
 // requires the mapping, if any; it only matters for dirty tracking (see
 // dirty.go), in which case only addresses in ar that are accessed for writing
@@ -85,11 +89,13 @@ func (mm *MemoryManager) mapASLocked(ctx context.Context, pseg pmaIterator, ar h
 		// Limit the range we map to ar, aligned to mapUnit.
 		setMapUnit(mapUnit)
 	} else if mf, ok := pseg.ValuePtr().file.(*pgalloc.MemoryFile); ok && mf.IsAsyncLoading() {
-		// Impose an arbitrary mapUnit in order to avoid calling
+		// Impose a mapUnit in order to avoid calling
 		// platform.AddressSpace.MapFile() => mf.DataFD() or mf.MapInternal()
 		// with unnecessarily large ranges, resulting in unnecessarily long
-		// waits.
-		setMapUnit(32 << 20)
+		// waits: each fault waits for every page in the mapped range to be
+		// loaded. A huge page bounds that to a ~1 ms read while keeping
+		// mappings huge-page-aligned.
+		setMapUnit(asyncLoadingMapUnit)
 	}
 	if checkInvariants {
 		if !mapAR.IsSupersetOf(ar) {

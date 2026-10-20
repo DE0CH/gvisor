@@ -40,10 +40,7 @@ import (
 // chosen by hashing their resource ID, since the set of private MemoryFiles
 // can change while pre-copy is in progress.
 func PrecopyPagesFileOffset(id checkpoint.ResourceID) uint64 {
-	const (
-		regionShift = 44
-		regions     = 1 << (63 - regionShift) // keep offsets below 1<<63
-	)
+	const regions = 1 << 63 / PrecopyRegionSize // keep offsets below 1<<63
 	if !id.Ok() {
 		return 0
 	}
@@ -51,8 +48,12 @@ func PrecopyPagesFileOffset(id checkpoint.ResourceID) uint64 {
 	h.Write([]byte(id.ContainerName))
 	h.Write([]byte{0})
 	h.Write([]byte(id.Path))
-	return (1 + h.Sum64()%(regions-1)) << regionShift
+	return (1 + h.Sum64()%(regions-1)) * PrecopyRegionSize
 }
+
+// PrecopyRegionSize is the size of each MemoryFile's region of a pre-copy
+// pages file. The main MemoryFile's region starts at offset 0.
+const PrecopyRegionSize = 1 << 44
 
 // PrecopySink receives MemoryFile contents during pre-copy. Offsets are
 // MemoryFile offsets.

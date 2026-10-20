@@ -1237,9 +1237,15 @@ func createMemoryFile(appHugePages bool, hostTHP HostTHP) (*pgalloc.MemoryFile, 
 	if err != nil {
 		return nil, fmt.Errorf("error creating memfd: %w", err)
 	}
-	memfile := os.NewFile(uintptr(memfd), memfileName)
+	return newMemoryFile(os.NewFile(uintptr(memfd), memfileName), false /* keepContents */, appHugePages, hostTHP)
+}
 
+// newMemoryFile returns the main MemoryFile backed by memfile, which it takes
+// ownership of. If keepContents is true, memfile's contents are kept to be
+// loaded by MemoryFile.LoadFrom with pgalloc.LoadOpts.ContentsPresent.
+func newMemoryFile(memfile *os.File, keepContents, appHugePages bool, hostTHP HostTHP) (*pgalloc.MemoryFile, error) {
 	mfopts := pgalloc.MemoryFileOpts{
+		KeepContents: keepContents,
 		// We can't enable pgalloc.MemoryFileOpts.UseHostMemcgPressure even if
 		// there are memory cgroups specified, because at this point we're already
 		// in a mount namespace in which the relevant cgroupfs is not visible.

@@ -413,10 +413,25 @@ func (cm *containerManager) Restore(o *sentryapi.RestoreOpts, _ *struct{}) (retE
 		timer:      timer,
 	}
 
-	// Create the main MemoryFile.
-	cm.restorer.mainMF, err = createMemoryFile(cm.l.root.conf.AppHugePages, cm.l.hostTHP)
-	if err != nil {
-		return fmt.Errorf("creating memory file: %v", err)
+	// Create the main MemoryFile, from the received memory file if there is
+	// one (see sentryapi.RestoreOpts.HaveMemoryFile).
+	if o.HaveMemoryFile {
+		if !o.HavePagesFile || o.UseCheckpointGofer {
+			return fmt.Errorf("a memory file requires a local pages file")
+		}
+		memFD, err := o.ReleaseFD(3)
+		if err != nil {
+			return err
+		}
+		cm.restorer.mainMF, err = newMemoryFile(memFD.ReleaseToFile(precopy.MemoryFileName), true /* keepContents */, cm.l.root.conf.AppHugePages, cm.l.hostTHP)
+		if err != nil {
+			return fmt.Errorf("creating memory file from the received memory file: %v", err)
+		}
+	} else {
+		cm.restorer.mainMF, err = createMemoryFile(cm.l.root.conf.AppHugePages, cm.l.hostTHP)
+		if err != nil {
+			return fmt.Errorf("creating memory file: %v", err)
+		}
 	}
 	timer.Reached("created MemoryFile")
 
@@ -433,6 +448,7 @@ func (cm *containerManager) Restore(o *sentryapi.RestoreOpts, _ *struct{}) (retE
 			// Images written by pre-copy migration store pages by
 			// MemoryFile offset.
 			PagesFileAtFileOffsets: cm.restorer.metadata[precopy.MetadataKey] == precopy.MetadataValue,
+			MainMFContentsPresent:  o.HaveMemoryFile,
 		}
 		// A migrated sandbox should run again as soon as possible: load its
 		// pages in bulk only once the kernel is restored.

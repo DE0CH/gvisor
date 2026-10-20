@@ -157,14 +157,21 @@ func (r *Restore) Execute(_ context.Context, f *flag.FlagSet, args ...any) subco
 	defer cu.Clean()
 
 	// With --migrate-listen, receive the image while the sandbox is created.
-	var migration chan migrationResult
+	// The source can connect and start sending as soon as we listen; we start
+	// reading once the sandbox exists (see below).
+	var (
+		migration      chan migrationResult
+		startReceiving chan struct{}
+	)
 	if r.migrateListen != "" {
 		ln, err := net.Listen("tcp", r.migrateListen)
 		if err != nil {
 			return util.Errorf("listening for the migration stream: %v", err)
 		}
 		migration = make(chan migrationResult, 1)
+		startReceiving = make(chan struct{})
 		go func() {
+			<-startReceiving
 			stats, err := receiveMigration(ln, r.imagePath, 0)
 			migration <- migrationResult{stats, err}
 		}()
@@ -227,6 +234,16 @@ func (r *Restore) Execute(_ context.Context, f *flag.FlagSet, args ...any) subco
 
 	var stats *migrationStats
 	if migration != nil {
+		// The received memory file becomes the sandbox's memory: write it from
+		// the sandbox's cgroup, so that the pages are charged to it.
+		if cg := c.Sandbox.CgroupJSON.Cgroup; cg != nil {
+			if restoreCgroup, err := cg.Join(); err != nil {
+				log.Warningf("Receiving migration outside the sandbox's cgroup: %v", err)
+			} else {
+				defer restoreCgroup()
+			}
+		}
+		close(startReceiving)
 		res := <-migration
 		if res.err != nil {
 			return util.Errorf("%v", res.err)

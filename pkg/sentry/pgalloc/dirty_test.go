@@ -391,3 +391,58 @@ func TestAsyncLoadHoldBulk(t *testing.T) {
 		}
 	})
 }
+
+// TestPrecopyContentsPresent checks restoring a MemoryFile whose backing file
+// already holds its pages at their offsets, as a sandbox received by pre-copy
+// migration does with its main MemoryFile.
+func TestPrecopyContentsPresent(t *testing.T) {
+	f := newSaveTestMemoryFile(t, false)
+	r := allocate(t, f, 16)
+	for i := uint64(0); i < 16; i++ {
+		writePage(t, f, r.Start+i*pg, byte(i+1), true)
+	}
+	f.Decommit(memmap.FileRange{Start: r.Start + 3*pg, End: r.Start + 4*pg})
+	memFile, err := os.CreateTemp("/dev/shm", "pgalloc-contents-test")
+	if err != nil {
+		t.Skipf("no tmpfs at /dev/shm: %v", err)
+	}
+	defer os.Remove(memFile.Name())
+	// The main MemoryFile's region starts at offset 0, so its pre-copy sink
+	// writes pages at their MemoryFile offsets.
+	sinks := fileSinks{f: memFile}
+	f.StartDirtyTracking()
+	defer f.StopDirtyTracking()
+	if _, err := f.SendRanges(f.AllocatedRanges(), sinks.MemoryFileSink(f.ResourceID())); err != nil {
+		t.Fatalf("SendRanges: %v", err)
+	}
+	writePage(t, f, r.Start+7*pg, 77, true)
+	var meta bytes.Buffer
+	if err := f.SaveTo(context.Background(), &meta, &SaveOpts{Precopy: &PrecopySaveOpts{Sinks: sinks}}); err != nil {
+		t.Fatalf("SaveTo: %v", err)
+	}
+	want := make([]byte, r.Length())
+	f.forEachMappingSlice(r, func(bs []byte) { copy(want, bs) })
+
+	restored, err := NewMemoryFile(memFile, MemoryFileOpts{
+		DelayedEviction:         DelayedEvictionDisabled,
+		DisableMemoryAccounting: true,
+		KeepContents:            true,
+	})
+	if err != nil {
+		t.Fatalf("NewMemoryFile: %v", err)
+	}
+	t.Cleanup(restored.Destroy)
+	if err := restored.LoadFrom(context.Background(), &meta, &LoadOpts{ContentsPresent: true, PagesFileAtFileOffsets: true}); err != nil {
+		t.Fatalf("LoadFrom: %v", err)
+	}
+	if restored.IsAsyncLoading() {
+		t.Errorf("restored MemoryFile is loading pages")
+	}
+	got := make([]byte, r.Length())
+	restored.forEachMappingSlice(r, func(bs []byte) { copy(got, bs) })
+	for i := uint64(0); i < r.Length()/pg; i++ {
+		if g, w := got[i*pg], want[i*pg]; g != w {
+			t.Errorf("page %d: got first byte %d, want %d", i, g, w)
+		}
+	}
+}

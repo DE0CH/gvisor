@@ -393,6 +393,10 @@ type AsyncMFLoaderOpts struct {
 	// migration; see pgalloc.LoadOpts.PagesFileAtFileOffsets.
 	PagesFileAtFileOffsets bool
 
+	// If MainMFContentsPresent is true, the main MemoryFile's backing file
+	// already holds its pages; see pgalloc.LoadOpts.ContentsPresent.
+	MainMFContentsPresent bool
+
 	// If HoldBulkLoading is true, only pages that are waited for are loaded
 	// until the kernel has been loaded (Kernel.LoadFrom returns), so that
 	// loading the rest doesn't compete with restore for CPU and delay it.
@@ -457,7 +461,9 @@ func (mfl *AsyncMFLoader) backgroundGoroutine(pagesMetadata io.ReadCloser, pages
 	timeline.Reached("loading mainMF")
 	log.Infof("Loading metadata for main MemoryFile: %p", mainMF)
 	ctx := context.Background()
+	opts.ContentsPresent = mflOpts.MainMFContentsPresent
 	err = mainMF.LoadFrom(ctx, pagesMetadata, &opts)
+	opts.ContentsPresent = false
 	mfl.metadataErr = err
 	mfl.mainMetadataErr = err
 	mfl.mainMFStartWg.Done()
