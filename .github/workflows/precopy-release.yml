@@ -1,0 +1,68 @@
+# Builds runsc, the containerd shim and runsc's sidecars (the //:release
+# layout), runs the tests of the pre-copy migration change, and publishes them
+# as a GitHub release of this fork with SHA-256 sums.
+#
+# Runs on tags "precopy-*" (the tag becomes the release), or manually, which
+# builds and tests without publishing.
+name: Pre-copy release
+
+"on":
+  push:
+    tags:
+      - "precopy-*"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    permissions:
+      contents: write
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+    - name: Free disk space
+      run: |
+        sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+        df -h /
+
+    - name: Test
+      run: |
+        make test TARGETS="//pkg/sentry/pgalloc:pgalloc_test //pkg/sentry/state/precopy:precopy_test //pkg/tcpip/transport/tcp/test/e2e:tcp_test"
+
+    - name: Build
+      run: |
+        mkdir -p bin
+        make copy TARGETS=//:release DESTINATION=bin/
+        find bin -type f | sort
+
+    - name: Package
+      run: |
+        set -euo pipefail
+        mkdir -p dist
+        # The same layout as the upstream release tarball: runsc, the shim and
+        # gvisor-bin/ next to each other.
+        tar --zstd -C bin -cf dist/gvisor.tar.zstd .
+        cp bin/runsc dist/runsc
+        cp bin/containerd-shim-runsc-v1 dist/containerd-shim-runsc-v1
+        (cd dist && sha256sum gvisor.tar.zstd runsc containerd-shim-runsc-v1 > SHA256SUMS)
+        cat dist/SHA256SUMS
+        bin/runsc --version
+
+    - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      with:
+        name: gvisor-precopy
+        path: dist/
+
+    - name: Publish release
+      if: startsWith(github.ref, 'refs/tags/precopy-')
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        gh release create "${GITHUB_REF_NAME}" dist/* \
+          --repo "${GITHUB_REPOSITORY}" \
+          --title "${GITHUB_REF_NAME}" \
+          --notes "runsc with pre-copy live migration (runsc checkpoint --migrate-to, runsc migrate-receive) and the TCP restore fix, built from ${GITHUB_SHA}. gvisor.tar.zstd has the upstream release layout (runsc, containerd-shim-runsc-v1, gvisor-bin/). Verify with: sha256sum -c SHA256SUMS"
