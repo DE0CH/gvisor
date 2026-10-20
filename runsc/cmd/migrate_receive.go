@@ -68,7 +68,7 @@ func (*MigrateReceive) FetchSpec(*config.Config, *flag.FlagSet) (string, *specs.
 // SetFlags implements subcommands.Command.SetFlags.
 func (m *MigrateReceive) SetFlags(f *flag.FlagSet) {
 	f.StringVar(&m.listen, "listen", "", "address to listen on for the migration stream, host:port")
-	f.StringVar(&m.imagePath, "image-path", "", "directory to write the checkpoint image to; a tmpfs keeps restore fast")
+	f.StringVar(&m.imagePath, "image-path", "", "directory to write the checkpoint image to. Its pages file is sparse and up to 2^63 bytes long, so this must be on tmpfs (or XFS, btrfs); tmpfs also keeps restore fast")
 	f.DurationVar(&m.timeout, "accept-timeout", 0, "give up if no stream arrives within this time (0: wait forever)")
 }
 
