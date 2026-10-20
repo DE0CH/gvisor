@@ -140,14 +140,34 @@ func (k *Kernel) Precopy(ctx context.Context, opts PrecopyOpts) error {
 	bw := float64(sent) / max(roundDur.Seconds(), 1e-3)
 	log.Infof("Pre-copy round 0: sent %d bytes in %s (%.1f MB/s)", sent, roundDur, bw/1e6)
 
+	// stalled counts consecutive rounds that didn't shrink the dirty set.
+	var prevDirty uint64
+	stalled := 0
 	for round := 1; ; round++ {
 		var dirty uint64
 		for _, mf := range mfs {
 			dirty += mf.DirtyBytes()
 		}
 		est := time.Duration(float64(dirty) / bw * float64(time.Second))
-		if est <= opts.Downtime || round > opts.MaxRounds {
-			log.Infof("Pre-copy: %d bytes dirty after %d rounds, estimated %s to send (target %s); stopping the sandbox", dirty, round, est, opts.Downtime)
+		if round > 1 && dirty*10 >= prevDirty*9 {
+			stalled++
+		} else {
+			stalled = 0
+		}
+		prevDirty = dirty
+		stop := ""
+		switch {
+		case est <= opts.Downtime:
+			stop = "the rest fits the downtime target"
+		case round > opts.MaxRounds:
+			stop = "reached the maximum number of rounds"
+		case stalled >= 2:
+			// The sandbox dirties memory about as fast as it can be sent:
+			// more rounds would only cost bandwidth.
+			stop = "not converging"
+		}
+		if stop != "" {
+			log.Infof("Pre-copy: %d bytes dirty after %d rounds, estimated %s to send (target %s): %s; stopping the sandbox", dirty, round, est, opts.Downtime, stop)
 			break
 		}
 

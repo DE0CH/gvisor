@@ -62,7 +62,13 @@ jobs:
       env:
         GH_TOKEN: ${{ github.token }}
       run: |
-        gh release create "${GITHUB_REF_NAME}" dist/* \
+        # The releases API sometimes answers 500; retry.
+        for i in 1 2 3 4 5; do
+          gh release view "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1 && break
+          gh release create "${GITHUB_REF_NAME}" dist/* \
           --repo "${GITHUB_REPOSITORY}" \
           --title "${GITHUB_REF_NAME}" \
-          --notes "runsc with pre-copy live migration (runsc checkpoint --migrate-to, runsc migrate-receive) and the TCP restore fix, built from ${GITHUB_SHA}. gvisor.tar.zstd has the upstream release layout (runsc, containerd-shim-runsc-v1, gvisor-bin/). Verify with: sha256sum -c SHA256SUMS"
+          --notes "runsc with pre-copy live migration (runsc checkpoint --migrate-to, runsc migrate-receive) and the TCP restore fix, built from ${GITHUB_SHA}. gvisor.tar.zstd has the upstream release layout (runsc, containerd-shim-runsc-v1, gvisor-bin/). Verify with: sha256sum -c SHA256SUMS" && break
+          sleep 20
+        done
+        gh release view "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" >/dev/null
