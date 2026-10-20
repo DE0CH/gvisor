@@ -55,7 +55,8 @@ func (*MigrateReceive) Usage() string {
 
 When it exits successfully, restore the container with
 "runsc restore --image-path <dir> --background" (the same flags as the source). It prints the
-stream's statistics as JSON on stdout.
+stream's statistics as JSON on stdout. "runsc restore --migrate-listen" does both in one step, and
+creates the sandbox while the stream is still arriving.
 `
 }
 
@@ -78,59 +79,84 @@ func (m *MigrateReceive) Execute(_ context.Context, f *flag.FlagSet, args ...any
 		f.Usage()
 		return subcommands.ExitUsageError
 	}
-	if err := os.MkdirAll(m.imagePath, 0700); err != nil {
-		util.Fatalf("creating image directory: %v", err)
-	}
 	ln, err := net.Listen("tcp", m.listen)
 	if err != nil {
 		util.Fatalf("listening: %v", err)
 	}
+	stats, err := receiveMigration(ln, m.imagePath, m.timeout)
+	if err != nil {
+		util.Fatalf("%v", err)
+	}
+	b, _ := json.Marshal(stats)
+	fmt.Println(string(b))
+	return subcommands.ExitSuccess
+}
+
+// migrationStats describes a received pre-copy migration stream.
+type migrationStats struct {
+	From      string  `json:"from"`
+	Bytes     uint64  `json:"bytes"`
+	PageBytes uint64  `json:"page_bytes"`
+	ZeroBytes uint64  `json:"zero_bytes"`
+	FileBytes uint64  `json:"file_bytes"`
+	Rounds    int     `json:"rounds"`
+	TotalMS   float64 `json:"total_ms"`
+	// FinalMS is the time from the end of the last live round to the end of
+	// the stream: roughly, how long the source was stopped before the image
+	// was complete.
+	FinalMS float64 `json:"final_ms"`
+	// RestoreMS is set by `runsc restore --migrate-listen`: the time from the
+	// end of the stream until the container was restored.
+	RestoreMS float64 `json:"restore_ms,omitempty"`
+
+	// end is when the stream ended.
+	end time.Time
+}
+
+func msSince(t, start time.Time) float64 {
+	return float64(t.Sub(start).Microseconds()) / 1000
+}
+
+// receiveMigration accepts one pre-copy migration stream on ln, writes the
+// checkpoint image it carries to dir, and closes ln.
+func receiveMigration(ln net.Listener, dir string, acceptTimeout time.Duration) (*migrationStats, error) {
 	defer ln.Close()
-	if m.timeout > 0 {
-		ln.(*net.TCPListener).SetDeadline(time.Now().Add(m.timeout))
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return nil, fmt.Errorf("creating image directory: %w", err)
+	}
+	if acceptTimeout > 0 {
+		if tl, ok := ln.(*net.TCPListener); ok {
+			tl.SetDeadline(time.Now().Add(acceptTimeout))
+		}
 	}
 	conn, err := ln.Accept()
 	if err != nil {
-		util.Fatalf("accepting the migration stream: %v", err)
+		return nil, fmt.Errorf("accepting the migration stream: %w", err)
 	}
 	defer conn.Close()
 	ln.Close()
 
 	start := time.Now()
 	var lastRound time.Time
-	stats, err := precopy.Receive(conn, m.imagePath, func(round uint32, bytes uint64) {
+	rs, err := precopy.Receive(conn, dir, func(round uint32, bytes uint64) {
 		lastRound = time.Now()
 		log.Infof("Pre-copy round %d done: %d bytes", round, bytes)
 	})
 	if err != nil {
-		util.Fatalf("receiving migration from %s: %v", conn.RemoteAddr(), err)
+		return nil, fmt.Errorf("receiving migration from %s: %w", conn.RemoteAddr(), err)
 	}
-	end := time.Now()
-	out := struct {
-		From      string  `json:"from"`
-		Bytes     uint64  `json:"bytes"`
-		PageBytes uint64  `json:"page_bytes"`
-		ZeroBytes uint64  `json:"zero_bytes"`
-		FileBytes uint64  `json:"file_bytes"`
-		Rounds    int     `json:"rounds"`
-		TotalMS   float64 `json:"total_ms"`
-		// FinalMS is the time from the last live round's end to the end of
-		// the stream: roughly, how long the source was stopped before the
-		// image was complete.
-		FinalMS float64 `json:"final_ms"`
-	}{
+	stats := &migrationStats{
 		From:      conn.RemoteAddr().String(),
-		Bytes:     stats.Bytes,
-		PageBytes: stats.PageBytes,
-		ZeroBytes: stats.ZeroBytes,
-		FileBytes: stats.FileBytes,
-		Rounds:    stats.Rounds,
-		TotalMS:   float64(end.Sub(start).Microseconds()) / 1000,
+		Bytes:     rs.Bytes,
+		PageBytes: rs.PageBytes,
+		ZeroBytes: rs.ZeroBytes,
+		FileBytes: rs.FileBytes,
+		Rounds:    rs.Rounds,
+		end:       time.Now(),
 	}
+	stats.TotalMS = msSince(stats.end, start)
 	if !lastRound.IsZero() {
-		out.FinalMS = float64(end.Sub(lastRound).Microseconds()) / 1000
+		stats.FinalMS = msSince(stats.end, lastRound)
 	}
-	b, _ := json.Marshal(out)
-	fmt.Println(string(b))
-	return subcommands.ExitSuccess
+	return stats, nil
 }

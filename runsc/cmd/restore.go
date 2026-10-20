@@ -16,8 +16,11 @@ package cmd
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"net"
 	"os"
+	"time"
 
 	"github.com/google/subcommands"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
@@ -57,6 +60,10 @@ type Restore struct {
 	// uncompressed for background to work; if the checkpoint is compressed,
 	// background has no effect.
 	background bool
+
+	// If migrateListen is set, the image is first received from a pre-copy
+	// migration stream accepted on this address.
+	migrateListen string
 }
 
 // Name implements subcommands.Command.Name.
@@ -81,6 +88,7 @@ func (r *Restore) SetFlags(f *flag.FlagSet) {
 	f.BoolVar(&r.detach, "detach", false, "detach from the container's process")
 	f.BoolVar(&r.direct, "direct", false, "use O_DIRECT for reading checkpoint pages file")
 	f.BoolVar(&r.background, "background", false, "allow image loading to continue after restore exits (requires uncompressed checkpoint)")
+	f.StringVar(&r.migrateListen, "migrate-listen", "", "receive the image first: accept one pre-copy migration stream (from `runsc checkpoint --migrate-to`) on this host:port and write it to --image-path, then restore from it. The sandbox is created while the stream arrives, so only the restore itself adds to the migration's downtime. Prints the stream's statistics as JSON.")
 
 	// Unimplemented flags necessary for compatibility with docker.
 
@@ -116,6 +124,12 @@ func (r *Restore) FetchSpec(conf *config.Config, f *flag.FlagSet) (string, *spec
 	return r.Create.FetchSpec(conf, f)
 }
 
+// migrationResult is the result of receiveMigration.
+type migrationResult struct {
+	stats *migrationStats
+	err   error
+}
+
 // Execute implements subcommands.Command.Execute.
 func (r *Restore) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcommands.ExitStatus {
 	if f.NArg() != 1 {
@@ -141,6 +155,21 @@ func (r *Restore) Execute(_ context.Context, f *flag.FlagSet, args ...any) subco
 
 	var cu cleanup.Cleanup
 	defer cu.Clean()
+
+	// With --migrate-listen, receive the image while the sandbox is created.
+	var migration chan migrationResult
+	if r.migrateListen != "" {
+		ln, err := net.Listen("tcp", r.migrateListen)
+		if err != nil {
+			return util.Errorf("listening for the migration stream: %v", err)
+		}
+		migration = make(chan migrationResult, 1)
+		go func() {
+			stats, err := receiveMigration(ln, r.imagePath, 0)
+			migration <- migrationResult{stats, err}
+		}()
+		cu.Add(func() { ln.Close() })
+	}
 
 	runArgs := container.Args{
 		ID:                  id,
@@ -196,10 +225,24 @@ func (r *Restore) Execute(_ context.Context, f *flag.FlagSet, args ...any) subco
 		runArgs.Spec = c.Spec
 	}
 
+	var stats *migrationStats
+	if migration != nil {
+		res := <-migration
+		if res.err != nil {
+			return util.Errorf("%v", res.err)
+		}
+		stats = res.stats
+	}
+
 	log.Debugf("Restore: %v", r.imagePath)
 	err = c.Restore(conf, r.imagePath, r.direct, r.background, nil /* networkArgs */)
 	if err != nil {
 		return util.Errorf("starting container: %v", err)
+	}
+	if stats != nil {
+		stats.RestoreMS = msSince(time.Now(), stats.end)
+		b, _ := json.Marshal(stats)
+		fmt.Println(string(b))
 	}
 
 	// If we allocate a terminal, forward signals to the sandbox process.
