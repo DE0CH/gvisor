@@ -17,6 +17,7 @@ package gofer
 import (
 	"fmt"
 
+	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/atomicbitops"
 	"gvisor.dev/gvisor/pkg/context"
@@ -153,7 +154,23 @@ func (fd *specialFileFD) OnClose(ctx context.Context) error {
 	if !fd.vfsfd.IsWritable() {
 		return nil
 	}
-	return flush(ctx, fd.handle.fdLisa)
+	if fd.handle.fdLisa.Ok() {
+		return flush(ctx, fd.handle.fdLisa)
+	}
+	// directfs: the host FD is the sentry's own. Remote filesystems (NFS,
+	// FUSE: the reason file handle sharing is disabled for them) report
+	// write-back errors such as EDQUOT or ENOSPC when a file is closed, as a
+	// flush of that file. Close a duplicate of the host FD so that the flush
+	// happens now and its error reaches the application's close(2), as on
+	// Linux; closing the FD itself in Release can't return an error.
+	if fd.handle.fd >= 0 {
+		nfd, err := unix.Dup(int(fd.handle.fd))
+		if err != nil {
+			return err
+		}
+		return unix.Close(nfd)
+	}
+	return nil
 }
 
 // Readiness implements waiter.Waitable.Readiness.
