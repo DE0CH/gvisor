@@ -1056,7 +1056,9 @@ func (pseg pmaIterator) getInternalMappingsLocked() error {
 		perms := pma.maxPerms
 		// We will never execute application code through an internal mapping.
 		perms.Execute = false
-		ims, err := pma.file.MapInternal(pseg.fileRange(), perms)
+		// These mappings are cached, so writes through them must be marked
+		// dirty for each access; see dirty.go.
+		ims, err := pgalloc.MapInternalUntracked(pma.file, pseg.fileRange(), perms)
 		if err != nil {
 			return err
 		}

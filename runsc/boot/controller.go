@@ -39,6 +39,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/socket/plugin"
 	"gvisor.dev/gvisor/pkg/sentry/state"
 	"gvisor.dev/gvisor/pkg/sentry/state/checkpointfiles"
+	"gvisor.dev/gvisor/pkg/sentry/state/precopy"
 	"gvisor.dev/gvisor/pkg/sentry/state/stateio"
 	"gvisor.dev/gvisor/pkg/sentry/state/stateipc"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
@@ -412,20 +413,27 @@ func (cm *containerManager) Restore(o *sentryapi.RestoreOpts, _ *struct{}) (retE
 		timer:      timer,
 	}
 
-	// Create the main MemoryFile.
-	cm.restorer.mainMF, err = createMemoryFile(cm.l.root.conf.AppHugePages, cm.l.hostTHP)
-	if err != nil {
-		return fmt.Errorf("creating memory file: %v", err)
+	// Create the main MemoryFile, from the received memory file if there is
+	// one (see sentryapi.RestoreOpts.HaveMemoryFile).
+	if o.HaveMemoryFile {
+		if !o.HavePagesFile || o.UseCheckpointGofer {
+			return fmt.Errorf("a memory file requires a local pages file")
+		}
+		memFD, err := o.ReleaseFD(3)
+		if err != nil {
+			return err
+		}
+		cm.restorer.mainMF, err = newMemoryFile(memFD.ReleaseToFile(precopy.MemoryFileName), true /* keepContents */, cm.l.root.conf.AppHugePages, cm.l.hostTHP)
+		if err != nil {
+			return fmt.Errorf("creating memory file from the received memory file: %v", err)
+		}
+	} else {
+		cm.restorer.mainMF, err = createMemoryFile(cm.l.root.conf.AppHugePages, cm.l.hostTHP)
+		if err != nil {
+			return fmt.Errorf("creating memory file: %v", err)
+		}
 	}
 	timer.Reached("created MemoryFile")
-
-	if o.HavePagesFile {
-		// This immediately starts loading the main MemoryFile asynchronously.
-		cm.restorer.asyncMFLoader = kernel.NewAsyncMFLoader(pagesMetadata, pagesFile, cm.restorer.mainMF, timer.Fork("PagesFileLoader")) // transfers ownership
-		pagesMetadata = nil
-		pagesFile = nil
-		timer.Reached("created async MF loader")
-	}
 
 	cm.restorer.stateFile, cm.restorer.metadata, err = state.NewStatefileReader(stateFile /* transfers ownership on success */, nil)
 	if err != nil {
@@ -433,6 +441,25 @@ func (cm *containerManager) Restore(o *sentryapi.RestoreOpts, _ *struct{}) (retE
 	}
 	stateFile = nil
 	timer.Reached("created statefile reader")
+
+	if o.HavePagesFile {
+		// This immediately starts loading the main MemoryFile asynchronously.
+		mflOpts := kernel.AsyncMFLoaderOpts{
+			// Images written by pre-copy migration store pages by
+			// MemoryFile offset.
+			PagesFileAtFileOffsets: cm.restorer.metadata[precopy.MetadataKey] == precopy.MetadataValue,
+			MainMFContentsPresent:  o.HaveMemoryFile,
+		}
+		// A migrated sandbox should run again as soon as possible: load its
+		// pages in bulk only once the kernel is restored.
+		mflOpts.HoldBulkLoading = mflOpts.PagesFileAtFileOffsets && o.Background
+		cm.restorer.asyncMFLoader = kernel.NewAsyncMFLoaderWithOpts(pagesMetadata, pagesFile, cm.restorer.mainMF, timer.Fork("PagesFileLoader"), mflOpts) // transfers ownership
+		pagesMetadata = nil
+		pagesFile = nil
+		timer.Reached("created async MF loader")
+	} else if v, ok := cm.restorer.metadata[precopy.MetadataKey]; ok {
+		return fmt.Errorf("checkpoint written by pre-copy migration (%s=%s) requires a pages file", precopy.MetadataKey, v)
+	}
 
 	cm.l.restoreDone = sync.NewCond(&cm.l.mu)
 	cm.l.state = restoringUnstarted

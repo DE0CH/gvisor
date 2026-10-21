@@ -69,8 +69,13 @@ func (mm *MemoryManager) HandleUserFault(ctx context.Context, addr hostarch.Addr
 	mm.activeMu.DowngradeLock()
 
 	// Map the faulted page into the active AddressSpace.
-	err = mm.mapASLocked(ctx, pseg, ar, memmap.PlatformEffectDefault)
+	err = mm.mapASLocked(ctx, pseg, ar, at, memmap.PlatformEffectDefault)
 	mm.activeMu.RUnlock()
+
+	if at.Write && mm.dirtyTrackedWritablePages.Load() > maxDirtyTrackedWritablePages {
+		// Merge the host mappings split by dirty tracking. See dirty.go.
+		mm.WriteProtectForDirtyTracking()
+	}
 	return err
 }
 
@@ -211,7 +216,7 @@ func (mm *MemoryManager) populateVMA(ctx context.Context, vseg vmaIterator, ar h
 	// Downgrade to a read-lock on activeMu since we don't need to mutate pmas
 	// anymore.
 	mm.activeMu.DowngradeLock()
-	err = mm.mapASLocked(ctx, pseg, ar, platformEffect)
+	err = mm.mapASLocked(ctx, pseg, ar, hostarch.NoAccess, platformEffect)
 	mm.activeMu.RUnlock()
 	return err
 }
@@ -261,7 +266,7 @@ func (mm *MemoryManager) populateVMAAndUnlock(ctx context.Context, vseg vmaItera
 
 	// As above, errors are silently ignored.
 	mm.activeMu.DowngradeLock()
-	mm.mapASLocked(ctx, pseg, ar, platformEffect)
+	mm.mapASLocked(ctx, pseg, ar, hostarch.NoAccess, platformEffect)
 	mm.activeMu.RUnlock()
 }
 
@@ -985,7 +990,7 @@ func (mm *MemoryManager) MLock(ctx context.Context, addr hostarch.Addr, length u
 		mm.mappingMu.RUnlock()
 		if mm.as != nil {
 			mm.activeMu.DowngradeLock()
-			err := mm.mapASLocked(ctx, mm.pmas.LowerBoundSegment(ar.Start), ar, memmap.PlatformEffectCommit)
+			err := mm.mapASLocked(ctx, mm.pmas.LowerBoundSegment(ar.Start), ar, hostarch.NoAccess, memmap.PlatformEffectCommit)
 			mm.activeMu.RUnlock()
 			if err != nil {
 				return err
@@ -1072,7 +1077,7 @@ func (mm *MemoryManager) MLockAll(ctx context.Context, opts MLockAllOpts) error 
 		mm.mappingMu.RUnlock()
 		if mm.as != nil {
 			mm.activeMu.DowngradeLock()
-			mm.mapASLocked(ctx, mm.pmas.FirstSegment(), mm.applicationAddrRange(), memmap.PlatformEffectCommit)
+			mm.mapASLocked(ctx, mm.pmas.FirstSegment(), mm.applicationAddrRange(), hostarch.NoAccess, memmap.PlatformEffectCommit)
 			mm.activeMu.RUnlock()
 		} else {
 			mm.activeMu.Unlock()

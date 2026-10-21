@@ -17,11 +17,14 @@ package cmd
 import (
 	"context"
 	"fmt"
+	"net"
 	"os"
 	"time"
 
 	"github.com/google/subcommands"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
+	"golang.org/x/sys/unix"
+	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/sentry/control/controlapi"
 	"gvisor.dev/gvisor/pkg/sentry/state/checkpointfiles"
 	"gvisor.dev/gvisor/pkg/state/statefile"
@@ -51,6 +54,13 @@ type Checkpoint struct {
 	// For example, if the checkpoint files will be stored on a network block
 	// device, which will be detached after the checkpoint is done.
 	direct bool
+
+	// migrateTo, if set, is the host:port of a `runsc migrate-receive` to
+	// which the container is migrated with pre-copy live migration, instead
+	// of being saved to imagePath.
+	migrateTo        string
+	migrateDowntime  time.Duration
+	migrateMaxRounds int
 }
 
 // Name implements subcommands.Command.Name.
@@ -83,6 +93,10 @@ func (c *Checkpoint) SetFlags(f *flag.FlagSet) {
 	c.splitFSCheckpointPaths.defaultPrefix = checkpointfiles.FSCheckpointDir
 	f.Var(&c.splitFSCheckpointPaths, "fs-checkpoint-paths", `[<prefix>=][<container>:]<path> target to include in the filesystem checkpoint (can be repeated). <prefix> defaults to "fs". The files are written to --image-path as <prefix>_*, or into a <prefix>/ subdirectory if <prefix> ends with "/". Paths containing "=" require an explicit prefix. For capturing all of tmpfs, the path should be "all-tmpfs".`)
 
+	f.StringVar(&c.migrateTo, "migrate-to", "", "host:port of a `runsc migrate-receive` on the destination host. Instead of saving to --image-path, the container's memory is copied there while it keeps running (pre-copy live migration), then it is stopped and the rest of its state is sent. Requires the systrap or ptrace platform.")
+	f.DurationVar(&c.migrateDowntime, "migrate-downtime", 100*time.Millisecond, "with --migrate-to: target duration for sending the last dirty memory pages while the container is stopped.")
+	f.IntVar(&c.migrateMaxRounds, "migrate-max-rounds", 20, "with --migrate-to: maximum number of pre-copy rounds after the first full copy.")
+
 	// Unimplemented flags necessary for compatibility with docker.
 	var wp string
 	f.StringVar(&wp, "work-path", "", "ignored")
@@ -111,6 +125,13 @@ func (c *Checkpoint) Execute(_ context.Context, f *flag.FlagSet, args ...any) su
 		util.Fatalf("loading container: %v", err)
 	}
 
+	if c.migrateTo != "" {
+		if err := c.migrate(conf, cont); err != nil {
+			util.Fatalf("migration failed: %v", err)
+		}
+		return subcommands.ExitSuccess
+	}
+
 	if c.imagePath == "" {
 		util.Fatalf("image-path flag must be provided")
 	}
@@ -137,6 +158,55 @@ func (c *Checkpoint) Execute(_ context.Context, f *flag.FlagSet, args ...any) su
 	}
 
 	return subcommands.ExitSuccess
+}
+
+// migrate migrates cont to c.migrateTo with pre-copy live migration.
+func (c *Checkpoint) migrate(conf *config.Config, cont *container.Container) error {
+	switch conf.Platform {
+	case "systrap", "ptrace":
+	default:
+		// Other platforms map MemoryFile pages in ways that dirty tracking
+		// doesn't cover (see pgalloc/dirty.go).
+		return fmt.Errorf("pre-copy migration is not supported on platform %q", conf.Platform)
+	}
+	if c.imagePath != "" || c.leaveRunning || len(c.splitFSCheckpointPaths.targets) > 0 {
+		return fmt.Errorf("--migrate-to can't be combined with --image-path, --leave-running or --fs-checkpoint-paths")
+	}
+	conn, err := net.DialTimeout("tcp", c.migrateTo, 10*time.Second)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	stream, err := conn.(*net.TCPConn).File()
+	if err != nil {
+		return err
+	}
+	defer stream.Close()
+	// The sentry writes to the stream with blocking writes.
+	if err := unix.SetNonblock(int(stream.Fd()), false); err != nil {
+		return err
+	}
+	start := time.Now()
+	opts := sandbox.CheckpointOpts{
+		// The state file is sent over the network uncompressed: compression
+		// is slower than the network within a region.
+		Compression:                statefile.CompressionLevelNone,
+		CudaCheckpointPath:         c.cudaCheckpointPath,
+		CudaCheckpointSequential:   c.cudaCheckpointSequential,
+		SaveRestoreExecArgv:        c.saveRestoreExecArgv,
+		SaveRestoreExecTimeout:     c.saveRestoreExecTimeout,
+		SaveRestoreExecContainerID: cont.ID,
+		Precopy: &sandbox.PrecopyOpts{
+			Stream:    stream,
+			Downtime:  c.migrateDowntime,
+			MaxRounds: c.migrateMaxRounds,
+		},
+	}
+	if err := cont.Checkpoint(conf, "", opts); err != nil {
+		return err
+	}
+	log.Infof("Migrated container %q to %s in %s", cont.ID, c.migrateTo, time.Since(start))
+	return nil
 }
 
 // CheckpointCompression represents checkpoint image writer behavior. The

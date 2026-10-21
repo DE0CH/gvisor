@@ -182,6 +182,11 @@ type MemoryManager struct {
 	// locking.
 	as platform.AddressSpace `state:"nosave"`
 
+	// dirtyTrackedWritablePages is the number of pages that have been made
+	// writable individually in as for dirty tracking since as was last
+	// write-protected. See dirty.go.
+	dirtyTrackedWritablePages atomicbitops.Int32 `state:"nosave"`
+
 	// If captureInvalidations is true, calls to MM.Invalidate() are recorded
 	// in capturedInvalidations rather than being applied immediately to pmas.
 	// This is to avoid a race condition in MM.Fork(); see that function for

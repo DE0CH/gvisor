@@ -46,7 +46,14 @@ func (mm *MemoryManager) UserModifiedGS(ctx context.Context) error {
 	return nil
 }
 
-// mapASLocked maps addresses in ar into mm.as.
+// asyncLoadingMapUnit is the maximum length mapped into an AddressSpace by
+// one fault while the backing MemoryFile is being loaded asynchronously.
+const asyncLoadingMapUnit = hostarch.HugePageSize
+
+// mapASLocked maps addresses in ar into mm.as. at is the access to ar that
+// requires the mapping, if any; it only matters for dirty tracking (see
+// dirty.go), in which case only addresses in ar that are accessed for writing
+// are mapped writable.
 //
 // Preconditions:
 //   - ar.Length() != 0.
@@ -54,7 +61,7 @@ func (mm *MemoryManager) UserModifiedGS(ctx context.Context) error {
 //   - pseg == mm.pmas.LowerBoundSegment(ar.Start).
 //
 // +checklocksread:mm.activeMu
-func (mm *MemoryManager) mapASLocked(ctx context.Context, pseg pmaIterator, ar hostarch.AddrRange, platformEffect memmap.MMapPlatformEffect) error {
+func (mm *MemoryManager) mapASLocked(ctx context.Context, pseg pmaIterator, ar hostarch.AddrRange, at hostarch.AccessType, platformEffect memmap.MMapPlatformEffect) error {
 	if platformEffect == memmap.PlatformEffectCommit && ar.Length() > (1<<30) {
 		// FIXME(b/445932215, b/445939339): Don't precommit very large ranges
 		// via platform.AddressSpace.MapFile() for now, since holding locks
@@ -82,11 +89,13 @@ func (mm *MemoryManager) mapASLocked(ctx context.Context, pseg pmaIterator, ar h
 		// Limit the range we map to ar, aligned to mapUnit.
 		setMapUnit(mapUnit)
 	} else if mf, ok := pseg.ValuePtr().file.(*pgalloc.MemoryFile); ok && mf.IsAsyncLoading() {
-		// Impose an arbitrary mapUnit in order to avoid calling
+		// Impose a mapUnit in order to avoid calling
 		// platform.AddressSpace.MapFile() => mf.DataFD() or mf.MapInternal()
 		// with unnecessarily large ranges, resulting in unnecessarily long
-		// waits.
-		setMapUnit(32 << 20)
+		// waits: each fault waits for every page in the mapped range to be
+		// loaded. A huge page bounds that to a ~1 ms read while keeping
+		// mappings huge-page-aligned.
+		setMapUnit(asyncLoadingMapUnit)
 	}
 	if checkInvariants {
 		if !mapAR.IsSupersetOf(ar) {
@@ -103,6 +112,18 @@ func (mm *MemoryManager) mapASLocked(ctx context.Context, pseg pmaIterator, ar h
 		perms := pma.effectivePerms
 		if pma.needCOW {
 			perms.Write = false
+		}
+		if mf, ok := isDirtyTracked(pma.file); ok && perms.Write {
+			perms.Write = false
+			if writeAR := pmaAR.Intersect(ar); at.Write && writeAR.Length() != 0 {
+				// Make only the written pages writable, after marking them
+				// dirty. Leave the rest of the pma as it is: mapping it again
+				// would write-protect pages that were made writable earlier.
+				perms.Write = true
+				mf.MarkDirty(pseg.fileRangeOf(writeAR))
+				mm.dirtyTrackedWritablePages.Add(int32(writeAR.Length() / hostarch.PageSize))
+				pmaMapAR = writeAR
+			}
 		}
 		if perms.Any() { // MapFile precondition
 			// If the length of the mapping exceeds singleMapThreshold, call

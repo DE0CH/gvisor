@@ -600,7 +600,7 @@ func (mm *MemoryManager) handleASIOFault(ctx context.Context, addr hostarch.Addr
 	mm.activeMu.DowngradeLock()
 	defer mm.activeMu.RUnlock()
 
-	err = mm.mapASLocked(ctx, pseg, ar, memmap.PlatformEffectDefault)
+	err = mm.mapASLocked(ctx, pseg, ar, at, memmap.PlatformEffectDefault)
 	return translateIOError(ctx, err)
 }
 
@@ -627,6 +627,9 @@ func (mm *MemoryManager) withInternalMappings(ctx context.Context, ar hostarch.A
 	mm.activeMu.RLock()
 	if pseg := mm.existingPMAsLocked(ar, at, ignorePermissions, true /* needInternalMappings */); pseg.Ok() {
 		defer mm.activeMu.RUnlock()
+		if at.Write {
+			mm.markDirtyLocked(ar)
+		}
 		n, err := f(mm.internalMappingsLocked(pseg, ar))
 		// Do not convert errors returned by f to EFAULT.
 		return int64(n), err
@@ -664,6 +667,9 @@ func (mm *MemoryManager) withInternalMappings(ctx context.Context, ar hostarch.A
 			return 0, translateIOError(ctx, imerr)
 		}
 		ar.End = ar.Start + hostarch.Addr(imlen)
+	}
+	if at.Write {
+		mm.markDirtyLocked(ar)
 	}
 
 	// Do I/O.
@@ -709,6 +715,9 @@ func (mm *MemoryManager) withVecInternalMappings(ctx context.Context, ars hostar
 	mm.activeMu.RLock()
 	if mm.existingVecPMAsLocked(ars, at, ignorePermissions, true /* needInternalMappings */) {
 		defer mm.activeMu.RUnlock()
+		if at.Write {
+			mm.markDirtyVecLocked(ars)
+		}
 		n, err := f(mm.vecInternalMappingsLocked(ars))
 		// Do not convert errors returned by f to EFAULT.
 		return int64(n), err
@@ -737,6 +746,9 @@ func (mm *MemoryManager) withVecInternalMappings(ctx context.Context, ars hostar
 	if imbs.NumBytes() == 0 {
 		t.flush(0, nil)
 		return 0, translateIOError(ctx, imerr)
+	}
+	if at.Write {
+		mm.markDirtyVecLocked(pars.TakeFirst64(int64(imbs.NumBytes())))
 	}
 
 	// Do I/O.

@@ -71,6 +71,7 @@ go_library(
         "//pkg/sentry/socket/netstack",
         "//pkg/sentry/state",
         "//pkg/sentry/state/checkpointfiles",
+        "//pkg/sentry/state/precopy",
         "//pkg/sentry/state/stateio",
         "//pkg/sentry/state/stateipc",
         "//pkg/sentry/strace",

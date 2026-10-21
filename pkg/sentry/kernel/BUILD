@@ -278,6 +278,7 @@ go_library(
         "pending_signals_state.go",
         "pidfd.go",
         "posixtimer.go",
+        "precopy.go",
         "process_group_list.go",
         "process_group_refs.go",
         "ptrace.go",

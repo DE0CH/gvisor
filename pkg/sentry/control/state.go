@@ -17,6 +17,7 @@ package control
 import (
 	"errors"
 	"fmt"
+	"io"
 	"strings"
 	"time"
 
@@ -31,6 +32,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/limits"
 	"gvisor.dev/gvisor/pkg/sentry/state"
 	"gvisor.dev/gvisor/pkg/sentry/state/checkpointfiles"
+	"gvisor.dev/gvisor/pkg/sentry/state/precopy"
 	"gvisor.dev/gvisor/pkg/sentry/state/stateio"
 	"gvisor.dev/gvisor/pkg/sentry/state/stateipc"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
@@ -84,6 +86,9 @@ func ConvertToStateSaveOpts(o *controlapi.SaveOpts) (*state.SaveOpts, error) {
 }
 
 func setSaveOpts(o *controlapi.SaveOpts, saveOpts *state.SaveOpts) error {
+	if o.Precopy != nil {
+		return setSaveOptsForPrecopy(o, saveOpts)
+	}
 	// TODO(b/541219576): Support checkpoint gofer with split checkpoint.
 	if len(o.SplitFSCheckpointPaths) > 0 && o.UseCheckpointGofer {
 		return fmt.Errorf("split filesystem checkpoint is not supported with checkpoint gofer")
@@ -92,6 +97,50 @@ func setSaveOpts(o *controlapi.SaveOpts, saveOpts *state.SaveOpts) error {
 		return setSaveOptsForCheckpointGofer(o, saveOpts)
 	}
 	return setSaveOptsForLocalCheckpointFiles(o, saveOpts)
+}
+
+func setSaveOptsForPrecopy(o *controlapi.SaveOpts, saveOpts *state.SaveOpts) error {
+	if o.HavePagesFile || o.UseCheckpointGofer || len(o.SplitFSCheckpointPaths) > 0 {
+		return fmt.Errorf("pre-copy migration can't be combined with a pages file, the checkpoint gofer or filesystem checkpoints")
+	}
+	if len(o.Files) != 1 {
+		return fmt.Errorf("pre-copy migration needs exactly one file (the stream), got %d", len(o.Files))
+	}
+	streamFD, err := o.ReleaseFD(0)
+	if err != nil {
+		return err
+	}
+	w, err := precopy.NewWriter(streamFD.FD())
+	if err != nil {
+		streamFD.Close()
+		return err
+	}
+	// Setting saveOpts.Destination/PagesMetadata/Precopy transfers ownership
+	// to saveOpts.
+	saveOpts.Destination = w.File(precopy.FileState)
+	saveOpts.PagesMetadata = w.File(precopy.FilePagesMetadata)
+	saveOpts.Precopy = &kernel.PrecopyOpts{
+		Stream:    &precopyStream{Writer: w, fd: streamFD},
+		Downtime:  o.Precopy.Downtime,
+		MaxRounds: o.Precopy.MaxRounds,
+	}
+	return nil
+}
+
+// precopyStream implements kernel.PrecopyStream on a precopy.Writer.
+type precopyStream struct {
+	*precopy.Writer
+	fd io.Closer
+}
+
+// Finish implements kernel.PrecopyStream.Finish.
+func (s *precopyStream) Finish() error {
+	return s.End()
+}
+
+// Close implements io.Closer.Close.
+func (s *precopyStream) Close() error {
+	return s.fd.Close()
 }
 
 func setSaveOptsForLocalCheckpointFiles(o *controlapi.SaveOpts, saveOpts *state.SaveOpts) error {

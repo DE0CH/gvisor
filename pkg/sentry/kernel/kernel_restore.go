@@ -344,6 +344,15 @@ func (k *Kernel) loadMemoryFiles(ctx context.Context, r io.Reader) error {
 //   - Wait for various events to occur before proceeding.
 //   - Report errors as they occur.
 type AsyncMFLoader struct {
+	// holdBulkLoading is AsyncMFLoaderOpts.HoldBulkLoading. It is immutable.
+	holdBulkLoading bool
+
+	// bulkMu protects apfl and bulkReleased, which let releaseBulkLoading
+	// race with the creation of apfl.
+	bulkMu       sync.Mutex
+	apfl         *pgalloc.AsyncPagesFileLoad
+	bulkReleased bool
+
 	// privateMFsChan is used to tell the background goroutine about private
 	// MemoryFiles, once they are known. This channel is written to exactly once.
 	privateMFsChan chan privateMFsInfo
@@ -375,17 +384,39 @@ type privateMFsInfo struct {
 // It takes ownership of the timeline, and will end it when done loading all
 // pages.
 func NewAsyncMFLoader(pagesMetadata io.ReadCloser, pagesFile stateio.AsyncReader, mainMF *pgalloc.MemoryFile, timeline *timing.Timeline) *AsyncMFLoader {
+	return NewAsyncMFLoaderWithOpts(pagesMetadata, pagesFile, mainMF, timeline, AsyncMFLoaderOpts{})
+}
+
+// AsyncMFLoaderOpts holds options for NewAsyncMFLoaderWithOpts.
+type AsyncMFLoaderOpts struct {
+	// PagesFileAtFileOffsets is true if the pages file was written by pre-copy
+	// migration; see pgalloc.LoadOpts.PagesFileAtFileOffsets.
+	PagesFileAtFileOffsets bool
+
+	// If MainMFContentsPresent is true, the main MemoryFile's backing file
+	// already holds its pages; see pgalloc.LoadOpts.ContentsPresent.
+	MainMFContentsPresent bool
+
+	// If HoldBulkLoading is true, only pages that are waited for are loaded
+	// until the kernel has been loaded (Kernel.LoadFrom returns), so that
+	// loading the rest doesn't compete with restore for CPU and delay it.
+	HoldBulkLoading bool
+}
+
+// NewAsyncMFLoaderWithOpts is NewAsyncMFLoader with options.
+func NewAsyncMFLoaderWithOpts(pagesMetadata io.ReadCloser, pagesFile stateio.AsyncReader, mainMF *pgalloc.MemoryFile, timeline *timing.Timeline, opts AsyncMFLoaderOpts) *AsyncMFLoader {
 	mfl := &AsyncMFLoader{
-		privateMFsChan: make(chan privateMFsInfo, 1),
+		privateMFsChan:  make(chan privateMFsInfo, 1),
+		holdBulkLoading: opts.HoldBulkLoading,
 	}
 	mfl.mainMFStartWg.Add(1)
 	mfl.metadataWg.Add(1)
 	mfl.loadWg.Add(1)
-	go mfl.backgroundGoroutine(pagesMetadata, pagesFile, mainMF, timeline)
+	go mfl.backgroundGoroutine(pagesMetadata, pagesFile, mainMF, timeline, opts)
 	return mfl
 }
 
-func (mfl *AsyncMFLoader) backgroundGoroutine(pagesMetadata io.ReadCloser, pagesFile stateio.AsyncReader, mainMF *pgalloc.MemoryFile, timeline *timing.Timeline) {
+func (mfl *AsyncMFLoader) backgroundGoroutine(pagesMetadata io.ReadCloser, pagesFile stateio.AsyncReader, mainMF *pgalloc.MemoryFile, timeline *timing.Timeline, mflOpts AsyncMFLoaderOpts) {
 	defer timeline.End()
 	defer pagesMetadata.Close()
 	cu := cleanup.Make(func() {
@@ -399,6 +430,16 @@ func (mfl *AsyncMFLoader) backgroundGoroutine(pagesMetadata io.ReadCloser, pages
 		defer mfl.loadWg.Done()
 		mfl.loadErr = err
 	}, timeline) // transfers ownership of pagesFile
+	if err == nil && mfl.holdBulkLoading {
+		apfl.HoldBulkLoading()
+		mfl.bulkMu.Lock()
+		mfl.apfl = apfl
+		released := mfl.bulkReleased
+		mfl.bulkMu.Unlock()
+		if released {
+			apfl.ReleaseBulkLoading()
+		}
+	}
 	if err != nil {
 		mfl.loadWg.Done()
 		mfl.mainMetadataErr = err
@@ -410,8 +451,9 @@ func (mfl *AsyncMFLoader) backgroundGoroutine(pagesMetadata io.ReadCloser, pages
 	cu.Add(apfl.MemoryFilesDone)
 
 	opts := pgalloc.LoadOpts{
-		PagesFile: apfl,
-		Timeline:  timeline,
+		PagesFile:              apfl,
+		PagesFileAtFileOffsets: mflOpts.PagesFileAtFileOffsets,
+		Timeline:               timeline,
 	}
 	// Note that we depend on opts.PagesFileOffset being carried between
 	// LoadFrom calls, so the same opts must be used for all calls.
@@ -419,7 +461,9 @@ func (mfl *AsyncMFLoader) backgroundGoroutine(pagesMetadata io.ReadCloser, pages
 	timeline.Reached("loading mainMF")
 	log.Infof("Loading metadata for main MemoryFile: %p", mainMF)
 	ctx := context.Background()
+	opts.ContentsPresent = mflOpts.MainMFContentsPresent
 	err = mainMF.LoadFrom(ctx, pagesMetadata, &opts)
+	opts.ContentsPresent = false
 	mfl.metadataErr = err
 	mfl.mainMetadataErr = err
 	mfl.mainMFStartWg.Done()
@@ -450,6 +494,20 @@ func (mfl *AsyncMFLoader) backgroundGoroutine(pagesMetadata io.ReadCloser, pages
 		return
 	}
 	log.Infof("All MemoryFile pages have been loaded.")
+}
+
+// releaseBulkLoading ends AsyncMFLoaderOpts.HoldBulkLoading.
+func (mfl *AsyncMFLoader) releaseBulkLoading() {
+	if mfl == nil || !mfl.holdBulkLoading {
+		return
+	}
+	mfl.bulkMu.Lock()
+	mfl.bulkReleased = true
+	apfl := mfl.apfl
+	mfl.bulkMu.Unlock()
+	if apfl != nil {
+		apfl.ReleaseBulkLoading()
+	}
 }
 
 // KickoffPrivate notifies the background goroutine of the private MemoryFiles.
