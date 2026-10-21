@@ -15,6 +15,7 @@
 package kernel
 
 import (
+	"errors"
 	"fmt"
 	"time"
 
@@ -50,7 +51,17 @@ type PrecopyOpts struct {
 
 	// MaxRounds is the maximum number of rounds after the first full copy.
 	MaxRounds int
+
+	// MaxDowntime, if non-zero, makes Precopy fail with ErrPrecopyNotConverging
+	// (the sandbox is never stopped) when the live rounds end with the
+	// remaining dirty pages estimated to take longer than MaxDowntime to send,
+	// e.g. a sandbox that rewrites memory about as fast as the link sends.
+	MaxDowntime time.Duration
 }
+
+// ErrPrecopyNotConverging is returned by Precopy when the remaining dirty pages
+// would exceed PrecopyOpts.MaxDowntime. The sandbox keeps running.
+var ErrPrecopyNotConverging = errors.New("pre-copy migration not converging")
 
 // PrecopyStats describes a completed pre-copy migration.
 type PrecopyStats struct {
@@ -165,6 +176,10 @@ func (k *Kernel) Precopy(ctx context.Context, opts PrecopyOpts) error {
 			// The sandbox dirties memory about as fast as it can be sent:
 			// more rounds would only cost bandwidth.
 			stop = "not converging"
+		}
+		if stop != "" && est > opts.Downtime && opts.MaxDowntime > 0 && est > opts.MaxDowntime {
+			log.Infof("Pre-copy: %d bytes dirty after %d rounds, estimated %s to send (limit %s): %s; aborting, the sandbox keeps running", dirty, round, est, opts.MaxDowntime, stop)
+			return fmt.Errorf("%w: %d bytes dirty after %d rounds, estimated %s stopped (limit %s)", ErrPrecopyNotConverging, dirty, round, est, opts.MaxDowntime)
 		}
 		if stop != "" {
 			log.Infof("Pre-copy: %d bytes dirty after %d rounds, estimated %s to send (target %s): %s; stopping the sandbox", dirty, round, est, opts.Downtime, stop)

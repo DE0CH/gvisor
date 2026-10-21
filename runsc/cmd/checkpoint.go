@@ -58,9 +58,10 @@ type Checkpoint struct {
 	// migrateTo, if set, is the host:port of a `runsc migrate-receive` to
 	// which the container is migrated with pre-copy live migration, instead
 	// of being saved to imagePath.
-	migrateTo        string
-	migrateDowntime  time.Duration
-	migrateMaxRounds int
+	migrateTo          string
+	migrateDowntime    time.Duration
+	migrateMaxRounds   int
+	migrateMaxDowntime time.Duration
 }
 
 // Name implements subcommands.Command.Name.
@@ -96,6 +97,7 @@ func (c *Checkpoint) SetFlags(f *flag.FlagSet) {
 	f.StringVar(&c.migrateTo, "migrate-to", "", "host:port of a `runsc migrate-receive` on the destination host. Instead of saving to --image-path, the container's memory is copied there while it keeps running (pre-copy live migration), then it is stopped and the rest of its state is sent. Requires the systrap or ptrace platform.")
 	f.DurationVar(&c.migrateDowntime, "migrate-downtime", 100*time.Millisecond, "with --migrate-to: target duration for sending the last dirty memory pages while the container is stopped.")
 	f.IntVar(&c.migrateMaxRounds, "migrate-max-rounds", 20, "with --migrate-to: maximum number of pre-copy rounds after the first full copy.")
+	f.DurationVar(&c.migrateMaxDowntime, "migrate-max-downtime", 0, "with --migrate-to: if non-zero, abort the migration and keep the container running here instead of stopping it when the last dirty pages are estimated to take longer than this to send (e.g. it rewrites memory about as fast as the link sends).")
 
 	// Unimplemented flags necessary for compatibility with docker.
 	var wp string
@@ -197,9 +199,10 @@ func (c *Checkpoint) migrate(conf *config.Config, cont *container.Container) err
 		SaveRestoreExecTimeout:     c.saveRestoreExecTimeout,
 		SaveRestoreExecContainerID: cont.ID,
 		Precopy: &sandbox.PrecopyOpts{
-			Stream:    stream,
-			Downtime:  c.migrateDowntime,
-			MaxRounds: c.migrateMaxRounds,
+			Stream:      stream,
+			Downtime:    c.migrateDowntime,
+			MaxRounds:   c.migrateMaxRounds,
+			MaxDowntime: c.migrateMaxDowntime,
 		},
 	}
 	if err := cont.Checkpoint(conf, "", opts); err != nil {

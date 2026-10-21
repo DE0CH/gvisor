@@ -120,9 +120,10 @@ func setSaveOptsForPrecopy(o *controlapi.SaveOpts, saveOpts *state.SaveOpts) err
 	saveOpts.Destination = w.File(precopy.FileState)
 	saveOpts.PagesMetadata = w.File(precopy.FilePagesMetadata)
 	saveOpts.Precopy = &kernel.PrecopyOpts{
-		Stream:    &precopyStream{Writer: w, fd: streamFD},
-		Downtime:  o.Precopy.Downtime,
-		MaxRounds: o.Precopy.MaxRounds,
+		Stream:      &precopyStream{Writer: w, fd: streamFD},
+		Downtime:    o.Precopy.Downtime,
+		MaxRounds:   o.Precopy.MaxRounds,
+		MaxDowntime: o.Precopy.MaxDowntime,
 	}
 	return nil
 }

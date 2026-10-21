@@ -94,6 +94,11 @@ type PrecopyOpts struct {
 	// MaxRounds is the maximum number of pre-copy rounds after the first
 	// full copy.
 	MaxRounds int `json:"max_rounds"`
+
+	// MaxDowntime, if non-zero, aborts the migration (the sandbox keeps
+	// running) instead of stopping the sandbox when the remaining dirty
+	// pages are estimated to take longer than this to send.
+	MaxDowntime time.Duration `json:"max_downtime"`
 }
 
 // SaveRestoreExecOpts contains options for executing a binary

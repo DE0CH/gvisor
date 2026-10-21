@@ -1906,9 +1906,10 @@ type PrecopyOpts struct {
 	// Checkpoint does not take ownership of it.
 	Stream *os.File
 
-	// Downtime and MaxRounds are as in controlapi.PrecopyOpts.
-	Downtime  time.Duration
-	MaxRounds int
+	// Downtime, MaxRounds and MaxDowntime are as in controlapi.PrecopyOpts.
+	Downtime    time.Duration
+	MaxRounds   int
+	MaxDowntime time.Duration
 }
 
 // Checkpoint sends the checkpoint call for a container in the sandbox.
@@ -1954,8 +1955,9 @@ func (s *Sandbox) Checkpoint(conf *config.Config, cid string, imagePath string, 
 		}
 		opt.FilePayload.Files = []*os.File{stream}
 		opt.Precopy = &controlapi.PrecopyOpts{
-			Downtime:  opts.Precopy.Downtime,
-			MaxRounds: opts.Precopy.MaxRounds,
+			Downtime:    opts.Precopy.Downtime,
+			MaxRounds:   opts.Precopy.MaxRounds,
+			MaxDowntime: opts.Precopy.MaxDowntime,
 		}
 	} else if err := s.setCheckpointOptsFiles(conf, imagePath, opts, bundles, &opt); err != nil {
 		return err
