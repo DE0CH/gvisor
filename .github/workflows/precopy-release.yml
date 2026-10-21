@@ -1,5 +1,5 @@
 # Builds runsc, the containerd shim and runsc's sidecars (the //:release
-# layout), runs the tests of the pre-copy migration change, and publishes them
+# layout), runs the tests of the pre-copy migration change and the gofer close fix, and publishes them
 # as a GitHub release of this fork with SHA-256 sums.
 #
 # Runs on tags "precopy-*" (the tag becomes the release), or manually, which
@@ -31,7 +31,7 @@ jobs:
 
     - name: Test
       run: |
-        make test TARGETS="//pkg/sentry/pgalloc:pgalloc_test //pkg/sentry/state/precopy:precopy_test //pkg/tcpip/transport/tcp/test/e2e:tcp_test"
+        make test TARGETS="//pkg/sentry/pgalloc:pgalloc_test //pkg/sentry/state/precopy:precopy_test //pkg/tcpip/transport/tcp/test/e2e:tcp_test //pkg/sentry/fsimpl/gofer:gofer_test"
 
     - name: Build
       run: |
@@ -68,7 +68,7 @@ jobs:
           gh release create "${GITHUB_REF_NAME}" dist/* \
           --repo "${GITHUB_REPOSITORY}" \
           --title "${GITHUB_REF_NAME}" \
-          --notes "runsc with pre-copy live migration (runsc checkpoint --migrate-to, runsc migrate-receive) and the TCP restore fix, built from ${GITHUB_SHA}. gvisor.tar.zstd has the upstream release layout (runsc, containerd-shim-runsc-v1, gvisor-bin/). Verify with: sha256sum -c SHA256SUMS" && break
+          --notes "runsc with pre-copy live migration (runsc checkpoint --migrate-to, runsc migrate-receive) the TCP restore fix and the directfs close(2) flush fix (a FUSE/NFS file's EDQUOT/ENOSPC on close reaches the application), built from ${GITHUB_SHA}. gvisor.tar.zstd has the upstream release layout (runsc, containerd-shim-runsc-v1, gvisor-bin/). Verify with: sha256sum -c SHA256SUMS" && break
           sleep 20
         done
         gh release view "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" >/dev/null
