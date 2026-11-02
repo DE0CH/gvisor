@@ -446,3 +446,98 @@ func TestPrecopyContentsPresent(t *testing.T) {
 		}
 	}
 }
+
+// TestPrecopyContentsPresentAfterZeroing checks that pages sent in a live
+// round that are then zeroed, decommitted or freed before the final save are
+// zero on a destination that restores with LoadOpts.ContentsPresent. Before
+// the final save sent such pages as zero ranges, the destination kept their
+// earlier contents: the application read them where it had written zeroes,
+// and fresh allocations of the freed pages (assumed to be zero) handed them
+// out as new memory.
+func TestPrecopyContentsPresentAfterZeroing(t *testing.T) {
+	f := newSaveTestMemoryFile(t, false)
+	r := allocate(t, f, 8)
+	freed := allocate(t, f, 8)
+	for i := uint64(0); i < 8; i++ {
+		writePage(t, f, r.Start+i*pg, byte(i+1), true)
+		writePage(t, f, freed.Start+i*pg, byte(i+101), true)
+	}
+	memFile, err := os.CreateTemp("/dev/shm", "pgalloc-zeroing-test")
+	if err != nil {
+		t.Skipf("no tmpfs at /dev/shm: %v", err)
+	}
+	defer os.Remove(memFile.Name())
+	sinks := fileSinks{f: memFile}
+	f.StartDirtyTracking()
+	defer f.StopDirtyTracking()
+	if _, err := f.SendRanges(f.AllocatedRanges(), sinks.MemoryFileSink(f.ResourceID())); err != nil {
+		t.Fatalf("SendRanges: %v", err)
+	}
+
+	// After the live round: a page overwritten with zeroes (tracked, still
+	// allocated), a decommitted page, and freed pages.
+	zeroed := memmap.FileRange{Start: r.Start + 2*pg, End: r.Start + 3*pg}
+	decommitted := memmap.FileRange{Start: r.Start + 5*pg, End: r.Start + 6*pg}
+	writePage(t, f, zeroed.Start, 0, true)
+	f.Decommit(decommitted)
+	f.DecRef(freed)
+
+	var meta bytes.Buffer
+	popts := &PrecopySaveOpts{Sinks: sinks}
+	if err := f.SaveTo(context.Background(), &meta, &SaveOpts{Precopy: popts}); err != nil {
+		t.Fatalf("SaveTo: %v", err)
+	}
+
+	page := make([]byte, pg)
+	zero := make([]byte, pg)
+	for _, c := range []struct {
+		name string
+		fr   memmap.FileRange
+	}{{"zeroed", zeroed}, {"decommitted", decommitted}, {"freed", freed}} {
+		for off := c.fr.Start; off < c.fr.End; off += pg {
+			if _, err := memFile.ReadAt(page, int64(off)); err != nil {
+				t.Fatalf("ReadAt(%#x): %v", off, err)
+			}
+			if !bytes.Equal(page, zero) {
+				t.Errorf("%s page at %#x: destination holds first byte %d, want a zero page", c.name, off, page[0])
+			}
+		}
+	}
+
+	restored, err := NewMemoryFile(memFile, MemoryFileOpts{
+		DelayedEviction:         DelayedEvictionDisabled,
+		DisableMemoryAccounting: true,
+		KeepContents:            true,
+	})
+	if err != nil {
+		t.Fatalf("NewMemoryFile: %v", err)
+	}
+	t.Cleanup(restored.Destroy)
+	if err := restored.LoadFrom(context.Background(), &meta, &LoadOpts{ContentsPresent: true, PagesFileAtFileOffsets: true}); err != nil {
+		t.Fatalf("LoadFrom: %v", err)
+	}
+	restored.forEachMappingSlice(r, func(bs []byte) {
+		for i := uint64(0); i < 8; i++ {
+			want := byte(i + 1)
+			if off := r.Start + i*pg; off == zeroed.Start || off == decommitted.Start {
+				want = 0
+			}
+			if got := bs[i*pg]; got != want {
+				t.Errorf("restored page %d: got first byte %d, want %d", i, got, want)
+			}
+		}
+	})
+	// New allocations on the destination get zeroed memory, wherever the
+	// allocator places them.
+	fresh, err := restored.Allocate(16*pg, AllocOpts{Kind: usage.Anonymous, Mode: AllocateAndCommit})
+	if err != nil {
+		t.Fatalf("Allocate: %v", err)
+	}
+	restored.forEachMappingSlice(fresh, func(bs []byte) {
+		for i := 0; i < len(bs); i += int(pg) {
+			if !bytes.Equal(bs[i:i+int(pg)], zero) {
+				t.Errorf("fresh allocation %v on the destination: page at slice offset %#x is not zero (first byte %d)", fresh, i, bs[i])
+			}
+		}
+	})
+}

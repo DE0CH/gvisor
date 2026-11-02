@@ -94,13 +94,17 @@ func (m *MigrateReceive) Execute(_ context.Context, f *flag.FlagSet, args ...any
 
 // migrationStats describes a received pre-copy migration stream.
 type migrationStats struct {
-	From      string  `json:"from"`
-	Bytes     uint64  `json:"bytes"`
-	PageBytes uint64  `json:"page_bytes"`
-	ZeroBytes uint64  `json:"zero_bytes"`
-	FileBytes uint64  `json:"file_bytes"`
-	Rounds    int     `json:"rounds"`
-	TotalMS   float64 `json:"total_ms"`
+	From      string `json:"from"`
+	Bytes     uint64 `json:"bytes"`
+	PageBytes uint64 `json:"page_bytes"`
+	ZeroBytes uint64 `json:"zero_bytes"`
+	FileBytes uint64 `json:"file_bytes"`
+	Rounds    int    `json:"rounds"`
+	// FinalPageBytes and FinalZeroBytes are the page contents and zero
+	// ranges the source sent while it was stopped.
+	FinalPageBytes uint64  `json:"final_page_bytes"`
+	FinalZeroBytes uint64  `json:"final_zero_bytes"`
+	TotalMS        float64 `json:"total_ms"`
 	// FinalMS is the time from the end of the last live round to the end of
 	// the stream: roughly, how long the source was stopped before the image
 	// was complete.
@@ -146,13 +150,15 @@ func receiveMigration(ln net.Listener, dir string, acceptTimeout time.Duration) 
 		return nil, fmt.Errorf("receiving migration from %s: %w", conn.RemoteAddr(), err)
 	}
 	stats := &migrationStats{
-		From:      conn.RemoteAddr().String(),
-		Bytes:     rs.Bytes,
-		PageBytes: rs.PageBytes,
-		ZeroBytes: rs.ZeroBytes,
-		FileBytes: rs.FileBytes,
-		Rounds:    rs.Rounds,
-		end:       time.Now(),
+		From:           conn.RemoteAddr().String(),
+		Bytes:          rs.Bytes,
+		PageBytes:      rs.PageBytes,
+		ZeroBytes:      rs.ZeroBytes,
+		FinalPageBytes: rs.FinalPageBytes,
+		FinalZeroBytes: rs.FinalZeroBytes,
+		FileBytes:      rs.FileBytes,
+		Rounds:         rs.Rounds,
+		end:            time.Now(),
 	}
 	stats.TotalMS = msSince(stats.end, start)
 	if !lastRound.IsZero() {

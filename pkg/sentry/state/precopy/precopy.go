@@ -296,6 +296,11 @@ type ReceiveStats struct {
 	FileBytes uint64
 	// Rounds is the number of Round records.
 	Rounds int
+	// FinalPageBytes and FinalZeroBytes count the contents of Pages and Zero
+	// records after the last Round record: what the source sent while it was
+	// stopped.
+	FinalPageBytes uint64
+	FinalZeroBytes uint64
 }
 
 // ErrIncomplete is returned by Receive if the stream ends before its End
@@ -364,6 +369,7 @@ func Receive(r io.Reader, dir string, onRound func(round uint32, bytes uint64)) 
 			off := binary.LittleEndian.Uint64(hdr[0:])
 			length := binary.LittleEndian.Uint64(hdr[8:])
 			stats.PageBytes += length
+			stats.FinalPageBytes += length
 			f, foff := fileAt(off)
 			for length != 0 {
 				n := min(length, uint64(len(buf)))
@@ -384,6 +390,7 @@ func Receive(r io.Reader, dir string, onRound func(round uint32, bytes uint64)) 
 			off := binary.LittleEndian.Uint64(hdr[0:])
 			length := binary.LittleEndian.Uint64(hdr[8:])
 			stats.ZeroBytes += length
+			stats.FinalZeroBytes += length
 			f, foff := fileAt(off)
 			if err := unix.Fallocate(int(f.Fd()), unix.FALLOC_FL_PUNCH_HOLE|unix.FALLOC_FL_KEEP_SIZE, int64(foff), int64(length)); err != nil {
 				return stats, fmt.Errorf("punching hole at %#x, length %#x: %w", off, length, err)
@@ -406,6 +413,7 @@ func Receive(r io.Reader, dir string, onRound func(round uint32, bytes uint64)) 
 				return stats, unexpectedEOF(err)
 			}
 			stats.Rounds++
+			stats.FinalPageBytes, stats.FinalZeroBytes = 0, 0
 			if onRound != nil {
 				onRound(binary.LittleEndian.Uint32(hdr[0:]), binary.LittleEndian.Uint64(hdr[4:]))
 			}

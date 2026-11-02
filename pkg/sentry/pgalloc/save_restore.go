@@ -547,22 +547,42 @@ func (f *MemoryFile) SaveTo(ctx context.Context, w io.Writer, opts *SaveOpts) er
 	log.Infof("MemoryFile(%p): saved metadata in %s", f, time.Duration(gohacks.Nanotime()-timeMetadataStart))
 
 	if opts.Precopy != nil {
-		// Send only the committed pages that the destination may not have
-		// yet: all of them if f was not tracked, otherwise those that were
-		// written since they were last sent. Pages that are not committed
-		// are not loaded on restore, so their contents don't matter.
+		// Send only the pages that the destination may not have yet: all
+		// committed pages if f was not tracked, otherwise those that were
+		// written since they were last sent.
+		//
+		// A dirty page that is no longer committed (freed, decommitted, or
+		// found to be all zeroes by the scan above) must be sent as zeroes:
+		// the destination may hold the non-zero contents sent in an earlier
+		// round, and a destination that restores with
+		// LoadOpts.ContentsPresent uses those contents as they are, so the
+		// application would read them where it wrote zeroes, and a later
+		// allocation of a free page (assumed to be zero) would hand them to
+		// the application as fresh memory.
 		timePagesStart := gohacks.Nanotime()
 		committed := f.memAcctRangesLocked(true /* committedOnly */)
 		frs := committed
+		var zeroFRs []memmap.FileRange
 		if f.IsDirtyTracking() {
-			frs = IntersectRanges(UnionRanges(f.TakeDirty(), f.StickyDirty()), committed)
+			dirty := UnionRanges(f.TakeDirty(), f.StickyDirty())
+			frs = IntersectRanges(dirty, committed)
+			zeroFRs = SubtractRanges(dirty, committed)
 		}
-		stats, err := f.SendRanges(frs, opts.Precopy.Sinks.MemoryFileSink(f.opts.ResourceID))
+		sink := opts.Precopy.Sinks.MemoryFileSink(f.opts.ResourceID)
+		stats, err := f.SendRanges(frs, sink)
 		opts.Precopy.Stats.Add(stats)
 		if err != nil {
 			return fmt.Errorf("failed to send pages: %w", err)
 		}
-		log.Infof("MemoryFile(%p): sent %d bytes of pages and %d bytes of zero ranges (of %d committed bytes) in %s", f, stats.DataBytes, stats.ZeroBytes, f.knownCommittedBytes, time.Duration(gohacks.Nanotime()-timePagesStart))
+		var uncommittedZeroBytes uint64
+		for _, fr := range zeroFRs {
+			if err := sink.WriteZero(fr.Start, fr.Length()); err != nil {
+				return fmt.Errorf("failed to send zero range: %w", err)
+			}
+			uncommittedZeroBytes += fr.Length()
+		}
+		opts.Precopy.Stats.ZeroBytes += uncommittedZeroBytes
+		log.Infof("MemoryFile(%p): sent %d bytes of pages and %d bytes of zero ranges (of %d committed bytes), and %d bytes of dirty pages that are no longer committed as zero ranges, in %s", f, stats.DataBytes, stats.ZeroBytes, f.knownCommittedBytes, uncommittedZeroBytes, time.Duration(gohacks.Nanotime()-timePagesStart))
 	} else if amfs == nil {
 		// Save committed pages.
 		ww := wire.Writer{Writer: w}
