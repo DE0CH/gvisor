@@ -1,8 +1,8 @@
-# merge.yml — when a workflow on a branch finishes, the gate decides (gate.yml): every workflow on the head commit green
-# → main moves to that commit; one red → the `gate` status is red. workflow_run runs main's copy of this file, so a
-# branch can't change it (this file and the gate.yml it calls are main's copies). `workflows` names the repo's CI (every
-# workflow that tests a branch push); `with: workflows` repeats it: the gate counts those runs only. Its deploy key is
-# the `merge` environment's secret, read here and nowhere else.
+# merge.yml — when a workflow of the repo's CI finishes on a branch, the gate decides (DE0CH/jarvis4 rust/gate): every
+# workflow on the head commit green → into main (a fast-forward on main's head, else main merged in cleanly), the
+# branch deleted; one red → the `gate` status red. workflow_run runs main's copy of this file, so a branch can't
+# change it; the job's deploy key is the `merge` environment's secret, which admits main only. `workflows` names the
+# repo's CI; GATE_WORKFLOWS repeats it: the gate counts those runs only.
 name: merge
 on:
   workflow_run:
@@ -11,10 +11,35 @@ on:
 permissions: { contents: read, pull-requests: write, statuses: write, actions: read }
 concurrency: { group: "merge-${{ github.event.workflow_run.head_branch }}", cancel-in-progress: false }
 jobs:
-  gate:
+  merge:
     if: >-
       github.event.workflow_run.head_branch != github.event.repository.default_branch &&
       github.event.workflow_run.head_repository.full_name == github.repository
-    uses: ./.github/workflows/gate.yml
-    with: { command: merge, branch: "${{ github.event.workflow_run.head_branch }}", sha: "${{ github.event.workflow_run.head_sha }}",
-            workflows: "branch, CI" }
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: merge
+    steps:
+      - name: the gate binary (DE0CH/jarvis4 rust/gate/pin.txt names it and its sha256)
+        id: bin
+        run: |
+          set -e
+          pin="$(curl -fsSL https://raw.githubusercontent.com/DE0CH/jarvis4/main/rust/gate/pin.txt || true)"
+          read -r sum url <<< "$pin"
+          if [ -z "$pin" ] || [ "$sum" = unreleased ]; then
+            echo "::warning::the gate is not released yet (DE0CH/jarvis4 rust/gate/pin.txt)"
+            echo ready=0 >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          curl -fsSL -o gate "$url"
+          echo "$sum  gate" | sha256sum -c -
+          chmod +x gate
+          echo ready=1 >> "$GITHUB_OUTPUT"
+      - if: steps.bin.outputs.ready == '1'
+        run: ./gate merge
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GATE_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          GATE_SHA: ${{ github.event.workflow_run.head_sha }}
+          GATE_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          GATE_WORKFLOWS: "branch, CI"
+          MERGE_DEPLOY_KEY: ${{ secrets.MERGE_DEPLOY_KEY }}

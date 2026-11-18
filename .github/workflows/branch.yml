@@ -1,12 +1,35 @@
-# branch.yml — every push to a branch other than main: its pull request and the gate's pending status (gate.yml; Deyao,
-# 2026-11-18: agents work on branches, which merge only when CI is green; a wip/ branch only runs CI).
-# No secrets reach it: this job runs the branch's own copy of gate.yml, and open needs none.
+# branch.yml — every push to a branch other than main: its pull request (a draft for wip/<topic>) and the commit's
+# `gate` status pending (DE0CH/jarvis4 rust/gate; Deyao, 2026-11-18: agents work on branches, which merge only when
+# every workflow on their commit is green). It runs the branch's own copy of this file, so it holds no secret.
 name: branch
 on:
   push:
     branches-ignore: [main]
 permissions: { contents: read, pull-requests: write, statuses: write }
 jobs:
-  gate:
-    uses: ./.github/workflows/gate.yml
-    with: { command: open, branch: "${{ github.ref_name }}", sha: "${{ github.sha }}" }
+  open:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: the gate binary (DE0CH/jarvis4 rust/gate/pin.txt names it and its sha256)
+        id: bin
+        run: |
+          set -e
+          pin="$(curl -fsSL https://raw.githubusercontent.com/DE0CH/jarvis4/main/rust/gate/pin.txt || true)"
+          read -r sum url <<< "$pin"
+          if [ -z "$pin" ] || [ "$sum" = unreleased ]; then
+            echo "::warning::the gate is not released yet (DE0CH/jarvis4 rust/gate/pin.txt)"
+            echo ready=0 >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          curl -fsSL -o gate "$url"
+          echo "$sum  gate" | sha256sum -c -
+          chmod +x gate
+          echo ready=1 >> "$GITHUB_OUTPUT"
+      - if: steps.bin.outputs.ready == '1'
+        run: ./gate open
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GATE_BRANCH: ${{ github.ref_name }}
+          GATE_SHA: ${{ github.sha }}
+          GATE_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
