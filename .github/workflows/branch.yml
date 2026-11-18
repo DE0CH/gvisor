@@ -1,0 +1,12 @@
+# branch.yml — every push to a branch other than main: its pull request and the gate's pending status (gate.yml; Deyao,
+# 2026-11-18: agents work on branches, which merge only when CI is green; a wip/ branch only runs CI).
+# No secrets reach it: this job runs the branch's own copy of gate.yml, and open needs none.
+name: branch
+on:
+  push:
+    branches-ignore: [main]
+permissions: { contents: read, pull-requests: write, statuses: write }
+jobs:
+  gate:
+    uses: ./.github/workflows/gate.yml
+    with: { command: open, branch: "${{ github.ref_name }}", sha: "${{ github.sha }}" }

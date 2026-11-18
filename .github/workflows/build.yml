@@ -3,7 +3,7 @@ name: CI
 "on":
   push:
     branches:
-      - "*"
+      - "**"  # every branch, claude/<topic> too: the gate waits for it
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
